@@ -16,6 +16,8 @@
 #ifndef DUMPUTILS_H
 #define DUMPUTILS_H
 
+#include <setjmp.h>
+
 #include "libpq-fe.h"
 #include "pqexpbuffer.h"
 
@@ -74,5 +76,9 @@ exit_horribly(const char *modulename, const char *fmt,...)
 __attribute__((format(PG_PRINTF_ATTRIBUTE, 2, 3), noreturn));
 extern void on_exit_nicely(on_exit_nicely_callback function, void *arg);
 extern void exit_nicely(int code) __attribute__((noreturn));
+extern void CleanDumpable( void );
+
+extern char **g_outMsgBuf;      /* Message buffer to return from the library */
+extern jmp_buf* g_jmpEnv;
 
 #endif   /* DUMPUTILS_H */

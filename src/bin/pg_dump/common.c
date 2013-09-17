@@ -21,6 +21,8 @@
 #include "dumpmem.h"
 #include "dumputils.h"
 
+#include "pg_dump.h"
+
 
 /*
  * Variables for mapping DumpId to DumpableObject
@@ -73,6 +75,18 @@ static void findParentsByOid(TableInfo *self,
 				 InhInfo *inhinfo, int numInherits);
 static int	strInArray(const char *pattern, char **arr, int arr_size);
 
+
+/* CleanDumpable -
+ *	 Cleans used memory for new dump ( if need )
+ */
+void
+CleanDumpable( void )
+{
+    free( dumpIdMap );
+	dumpIdMap = NULL;
+    allocedDumpIds = 0;
+    lastDumpId = 0;
+}
 
 /*
  * getSchemaData

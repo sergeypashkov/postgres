@@ -566,4 +566,6 @@ extern DefaultACLInfo *getDefaultACLs(Archive *fout, int *numDefaultACLs);
 extern void getExtensionMembership(Archive *fout, ExtensionInfo extinfo[],
 					   int numExtensions);
 
+extern int pg_dump( int argc, const char** argv, char** outMsgBuf );
+
 #endif   /* PG_DUMP_H */
