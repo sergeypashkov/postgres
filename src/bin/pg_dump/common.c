@@ -911,3 +911,15 @@ simple_oid_list_member(SimpleOidList *list, Oid val)
 	}
 	return false;
 }
+
+/* CleanDumpable -
+ *	 Cleans used memory for new dump ( if need )
+ */
+void
+CleanDumpable( void )
+{
+    free( dumpIdMap );
+	dumpIdMap = NULL;
+    allocedDumpIds = 0;
+    lastDumpId = 0;
+}
