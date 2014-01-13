@@ -64,11 +64,15 @@ typedef struct
 
 
 static void rebuild_relation(Relation OldHeap, Oid indexOid,
-				 int freeze_min_age, int freeze_table_age, bool verbose);
+				 int freeze_min_age, int freeze_table_age,
+				 int multixact_freeze_min_age, int multixact_freeze_table_age,
+				 bool verbose);
 static void copy_heap_data(Oid OIDNewHeap, Oid OIDOldHeap, Oid OIDOldIndex,
-			   int freeze_min_age, int freeze_table_age, bool verbose,
+			   int freeze_min_age, int freeze_table_age,
+			   int multixact_freeze_min_age, int multixact_freeze_table_age,
+			   bool verbose,
 			   bool *pSwapToastByContent, TransactionId *pFreezeXid,
-			   MultiXactId *pFreezeMulti);
+			   MultiXactId *pCutoffMulti);
 static List *get_tables_to_cluster(MemoryContext cluster_context);
 static void reform_and_rewrite_tuple(HeapTuple tuple,
 						 TupleDesc oldTupDesc, TupleDesc newTupDesc,
@@ -175,8 +179,11 @@ cluster(ClusterStmt *stmt, bool isTopLevel)
 		/* close relation, keep lock till commit */
 		heap_close(rel, NoLock);
 
-		/* Do the job */
-		cluster_rel(tableOid, indexOid, false, stmt->verbose, -1, -1);
+		/*
+		 * Do the job.  We use a -1 freeze_min_age to avoid having CLUSTER
+		 * freeze tuples earlier than a plain VACUUM would.
+		 */
+		cluster_rel(tableOid, indexOid, false, stmt->verbose, -1, -1, -1, -1);
 	}
 	else
 	{
@@ -225,8 +232,9 @@ cluster(ClusterStmt *stmt, bool isTopLevel)
 			StartTransactionCommand();
 			/* functions in indexes may want a snapshot set */
 			PushActiveSnapshot(GetTransactionSnapshot());
+			/* Do the job.  As above, use a -1 freeze_min_age. */
 			cluster_rel(rvtc->tableOid, rvtc->indexOid, true, stmt->verbose,
-						-1, -1);
+						-1, -1, -1, -1);
 			PopActiveSnapshot();
 			CommitTransactionCommand();
 		}
@@ -258,7 +266,8 @@ cluster(ClusterStmt *stmt, bool isTopLevel)
  */
 void
 cluster_rel(Oid tableOid, Oid indexOid, bool recheck, bool verbose,
-			int freeze_min_age, int freeze_table_age)
+			int freeze_min_age, int freeze_table_age,
+			int multixact_freeze_min_age, int multixact_freeze_table_age)
 {
 	Relation	OldHeap;
 
@@ -403,6 +412,7 @@ cluster_rel(Oid tableOid, Oid indexOid, bool recheck, bool verbose,
 
 	/* rebuild_relation does all the dirty work */
 	rebuild_relation(OldHeap, indexOid, freeze_min_age, freeze_table_age,
+					 multixact_freeze_min_age, multixact_freeze_table_age,
 					 verbose);
 
 	/* NB: rebuild_relation does heap_close() on OldHeap */
@@ -562,7 +572,9 @@ mark_index_clustered(Relation rel, Oid indexOid, bool is_internal)
  */
 static void
 rebuild_relation(Relation OldHeap, Oid indexOid,
-				 int freeze_min_age, int freeze_table_age, bool verbose)
+				 int freeze_min_age, int freeze_table_age,
+				 int multixact_freeze_min_age, int multixact_freeze_table_age,
+				 bool verbose)
 {
 	Oid			tableOid = RelationGetRelid(OldHeap);
 	Oid			tableSpace = OldHeap->rd_rel->reltablespace;
@@ -570,7 +582,7 @@ rebuild_relation(Relation OldHeap, Oid indexOid,
 	bool		is_system_catalog;
 	bool		swap_toast_by_content;
 	TransactionId frozenXid;
-	MultiXactId frozenMulti;
+	MultiXactId cutoffMulti;
 
 	/* Mark the correct index as clustered */
 	if (OidIsValid(indexOid))
@@ -587,8 +599,10 @@ rebuild_relation(Relation OldHeap, Oid indexOid,
 
 	/* Copy the heap data into the new table in the desired order */
 	copy_heap_data(OIDNewHeap, tableOid, indexOid,
-				   freeze_min_age, freeze_table_age, verbose,
-				   &swap_toast_by_content, &frozenXid, &frozenMulti);
+				   freeze_min_age, freeze_table_age,
+				   multixact_freeze_min_age, multixact_freeze_table_age,
+				   verbose,
+				   &swap_toast_by_content, &frozenXid, &cutoffMulti);
 
 	/*
 	 * Swap the physical files of the target and transient tables, then
@@ -596,7 +610,7 @@ rebuild_relation(Relation OldHeap, Oid indexOid,
 	 */
 	finish_heap_swap(tableOid, OIDNewHeap, is_system_catalog,
 					 swap_toast_by_content, false, true,
-					 frozenXid, frozenMulti);
+					 frozenXid, cutoffMulti);
 }
 
 
@@ -725,12 +739,15 @@ make_new_heap(Oid OIDOldHeap, Oid NewTableSpace)
  * There are two output parameters:
  * *pSwapToastByContent is set true if toast tables must be swapped by content.
  * *pFreezeXid receives the TransactionId used as freeze cutoff point.
+ * *pCutoffMulti receives the MultiXactId used as a cutoff point.
  */
 static void
 copy_heap_data(Oid OIDNewHeap, Oid OIDOldHeap, Oid OIDOldIndex,
-			   int freeze_min_age, int freeze_table_age, bool verbose,
+			   int freeze_min_age, int freeze_table_age,
+			   int multixact_freeze_min_age, int multixact_freeze_table_age,
+			   bool verbose,
 			   bool *pSwapToastByContent, TransactionId *pFreezeXid,
-			   MultiXactId *pFreezeMulti)
+			   MultiXactId *pCutoffMulti)
 {
 	Relation	NewHeap,
 				OldHeap,
@@ -746,7 +763,7 @@ copy_heap_data(Oid OIDNewHeap, Oid OIDOldHeap, Oid OIDOldIndex,
 	bool		is_system_catalog;
 	TransactionId OldestXmin;
 	TransactionId FreezeXid;
-	MultiXactId MultiXactFrzLimit;
+	MultiXactId MultiXactCutoff;
 	RewriteState rwstate;
 	bool		use_sort;
 	Tuplesortstate *tuplesort;
@@ -841,13 +858,13 @@ copy_heap_data(Oid OIDNewHeap, Oid OIDOldHeap, Oid OIDOldIndex,
 		*pSwapToastByContent = false;
 
 	/*
-	 * compute xids used to freeze and weed out dead tuples.  We use -1
-	 * freeze_min_age to avoid having CLUSTER freeze tuples earlier than a
-	 * plain VACUUM would.
+	 * compute xids used to freeze and weed out dead tuples.
 	 */
 	vacuum_set_xid_limits(freeze_min_age, freeze_table_age,
+						  multixact_freeze_min_age, multixact_freeze_table_age,
 						  OldHeap->rd_rel->relisshared,
-						  &OldestXmin, &FreezeXid, NULL, &MultiXactFrzLimit);
+						  &OldestXmin, &FreezeXid, NULL, &MultiXactCutoff,
+						  NULL);
 
 	/*
 	 * FreezeXid will become the table's new relfrozenxid, and that mustn't go
@@ -858,14 +875,14 @@ copy_heap_data(Oid OIDNewHeap, Oid OIDOldHeap, Oid OIDOldIndex,
 
 	/* return selected values to caller */
 	*pFreezeXid = FreezeXid;
-	*pFreezeMulti = MultiXactFrzLimit;
+	*pCutoffMulti = MultiXactCutoff;
 
 	/* Remember if it's a system catalog */
 	is_system_catalog = IsSystemRelation(OldHeap);
 
 	/* Initialize the rewrite operation */
 	rwstate = begin_heap_rewrite(NewHeap, OldestXmin, FreezeXid,
-								 MultiXactFrzLimit, use_wal);
+								 MultiXactCutoff, use_wal);
 
 	/*
 	 * Decide whether to use an indexscan or seqscan-and-optional-sort to scan
@@ -1124,7 +1141,7 @@ swap_relation_files(Oid r1, Oid r2, bool target_is_pg_class,
 					bool swap_toast_by_content,
 					bool is_internal,
 					TransactionId frozenXid,
-					MultiXactId frozenMulti,
+					MultiXactId cutoffMulti,
 					Oid *mapped_tables)
 {
 	Relation	relRelation;
@@ -1237,8 +1254,8 @@ swap_relation_files(Oid r1, Oid r2, bool target_is_pg_class,
 	{
 		Assert(TransactionIdIsNormal(frozenXid));
 		relform1->relfrozenxid = frozenXid;
-		Assert(MultiXactIdIsValid(frozenMulti));
-		relform1->relminmxid = frozenMulti;
+		Assert(MultiXactIdIsValid(cutoffMulti));
+		relform1->relminmxid = cutoffMulti;
 	}
 
 	/* swap size statistics too, since new rel has freshly-updated stats */
@@ -1312,7 +1329,7 @@ swap_relation_files(Oid r1, Oid r2, bool target_is_pg_class,
 									swap_toast_by_content,
 									is_internal,
 									frozenXid,
-									frozenMulti,
+									cutoffMulti,
 									mapped_tables);
 			}
 			else
@@ -1443,7 +1460,7 @@ finish_heap_swap(Oid OIDOldHeap, Oid OIDNewHeap,
 				 bool check_constraints,
 				 bool is_internal,
 				 TransactionId frozenXid,
-				 MultiXactId frozenMulti)
+				 MultiXactId cutoffMulti)
 {
 	ObjectAddress object;
 	Oid			mapped_tables[4];
@@ -1460,7 +1477,7 @@ finish_heap_swap(Oid OIDOldHeap, Oid OIDNewHeap,
 	swap_relation_files(OIDOldHeap, OIDNewHeap,
 						(OIDOldHeap == RelationRelationId),
 						swap_toast_by_content, is_internal,
-						frozenXid, frozenMulti, mapped_tables);
+						frozenXid, cutoffMulti, mapped_tables);
 
 	/*
 	 * If it's a system catalog, queue an sinval message to flush all

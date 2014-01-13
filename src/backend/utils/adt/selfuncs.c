@@ -1529,30 +1529,28 @@ booltestsel(PlannerInfo *root, BoolTestType booltesttype, Node *arg,
 			/*
 			 * No most-common-value info available. Still have null fraction
 			 * information, so use it for IS [NOT] UNKNOWN. Otherwise adjust
-			 * for null fraction and assume an even split for boolean tests.
+			 * for null fraction and assume a 50-50 split of TRUE and FALSE.
 			 */
 			switch (booltesttype)
 			{
 				case IS_UNKNOWN:
-
-					/*
-					 * Use freq_null directly.
-					 */
+					/* select only NULL values */
 					selec = freq_null;
 					break;
 				case IS_NOT_UNKNOWN:
-
-					/*
-					 * Select not unknown (not null) values. Calculate from
-					 * freq_null.
-					 */
+					/* select non-NULL values */
 					selec = 1.0 - freq_null;
 					break;
 				case IS_TRUE:
-				case IS_NOT_TRUE:
 				case IS_FALSE:
-				case IS_NOT_FALSE:
+					/* Assume we select half of the non-NULL values */
 					selec = (1.0 - freq_null) / 2.0;
+					break;
+				case IS_NOT_TRUE:
+				case IS_NOT_FALSE:
+					/* Assume we select NULLs plus half of the non-NULLs */
+					/* equiv. to freq_null + (1.0 - freq_null) / 2.0 */
+					selec = (freq_null + 1.0) / 2.0;
 					break;
 				default:
 					elog(ERROR, "unrecognized booltesttype: %d",
@@ -1735,6 +1733,10 @@ scalararraysel(PlannerInfo *root,
 	Assert(list_length(clause->args) == 2);
 	leftop = (Node *) linitial(clause->args);
 	rightop = (Node *) lsecond(clause->args);
+
+	/* aggressively reduce both sides to constants */
+	leftop = estimate_expression_value(root, leftop);
+	rightop = estimate_expression_value(root, rightop);
 
 	/* get nominal (after relabeling) element type of rightop */
 	nominal_element_type = get_base_element_type(exprType(rightop));
@@ -4507,6 +4509,12 @@ examine_simple_variable(PlannerInfo *root, Var *var,
 		TargetEntry *ste;
 
 		/*
+		 * Punt if it's a whole-row var rather than a plain column reference.
+		 */
+		if (var->varattno == InvalidAttrNumber)
+			return;
+
+		/*
 		 * Punt if subquery uses set operations or GROUP BY, as these will
 		 * mash underlying columns' stats beyond recognition.  (Set ops are
 		 * particularly nasty; if we forged ahead, we would return stats
@@ -6851,7 +6859,8 @@ gincost_pattern(IndexOptInfo *index, int indexcol,
  * appropriately.  If the query is unsatisfiable, return false.
  */
 static bool
-gincost_opexpr(IndexOptInfo *index, OpExpr *clause, GinQualCounts *counts)
+gincost_opexpr(PlannerInfo *root, IndexOptInfo *index, OpExpr *clause,
+			   GinQualCounts *counts)
 {
 	Node	   *leftop = get_leftop((Expr *) clause);
 	Node	   *rightop = get_rightop((Expr *) clause);
@@ -6874,6 +6883,9 @@ gincost_opexpr(IndexOptInfo *index, OpExpr *clause, GinQualCounts *counts)
 		elog(ERROR, "could not match index to operand");
 		operand = NULL;			/* keep compiler quiet */
 	}
+
+	/* aggressively reduce to a constant, and look through relabeling */
+	operand = estimate_expression_value(root, operand);
 
 	if (IsA(operand, RelabelType))
 		operand = (Node *) ((RelabelType *) operand)->arg;
@@ -6913,7 +6925,8 @@ gincost_opexpr(IndexOptInfo *index, OpExpr *clause, GinQualCounts *counts)
  * by N, causing gincostestimate to scale up its estimates accordingly.
  */
 static bool
-gincost_scalararrayopexpr(IndexOptInfo *index, ScalarArrayOpExpr *clause,
+gincost_scalararrayopexpr(PlannerInfo *root,
+						  IndexOptInfo *index, ScalarArrayOpExpr *clause,
 						  double numIndexEntries,
 						  GinQualCounts *counts)
 {
@@ -6937,6 +6950,9 @@ gincost_scalararrayopexpr(IndexOptInfo *index, ScalarArrayOpExpr *clause,
 	/* index column must be on the left */
 	if ((indexcol = find_index_column(leftop, index)) < 0)
 		elog(ERROR, "could not match index to operand");
+
+	/* aggressively reduce to a constant, and look through relabeling */
+	rightop = estimate_expression_value(root, rightop);
 
 	if (IsA(rightop, RelabelType))
 		rightop = (Node *) ((RelabelType *) rightop)->arg;
@@ -7155,7 +7171,8 @@ gincostestimate(PG_FUNCTION_ARGS)
 		clause = rinfo->clause;
 		if (IsA(clause, OpExpr))
 		{
-			matchPossible = gincost_opexpr(index,
+			matchPossible = gincost_opexpr(root,
+										   index,
 										   (OpExpr *) clause,
 										   &counts);
 			if (!matchPossible)
@@ -7163,7 +7180,8 @@ gincostestimate(PG_FUNCTION_ARGS)
 		}
 		else if (IsA(clause, ScalarArrayOpExpr))
 		{
-			matchPossible = gincost_scalararrayopexpr(index,
+			matchPossible = gincost_scalararrayopexpr(root,
+													  index,
 												(ScalarArrayOpExpr *) clause,
 													  numEntries,
 													  &counts);

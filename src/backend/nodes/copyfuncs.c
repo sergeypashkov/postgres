@@ -1917,8 +1917,8 @@ _copyLateralJoinInfo(const LateralJoinInfo *from)
 {
 	LateralJoinInfo *newnode = makeNode(LateralJoinInfo);
 
-	COPY_SCALAR_FIELD(lateral_rhs);
 	COPY_BITMAPSET_FIELD(lateral_lhs);
+	COPY_BITMAPSET_FIELD(lateral_rhs);
 
 	return newnode;
 }
@@ -1952,8 +1952,8 @@ _copyPlaceHolderInfo(const PlaceHolderInfo *from)
 	COPY_SCALAR_FIELD(phid);
 	COPY_NODE_FIELD(ph_var);
 	COPY_BITMAPSET_FIELD(ph_eval_at);
+	COPY_BITMAPSET_FIELD(ph_lateral);
 	COPY_BITMAPSET_FIELD(ph_needed);
-	COPY_BITMAPSET_FIELD(ph_may_need);
 	COPY_SCALAR_FIELD(ph_width);
 
 	return newnode;
@@ -2377,6 +2377,7 @@ _copyConstraint(const Constraint *from)
 	COPY_SCALAR_FIELD(fk_upd_action);
 	COPY_SCALAR_FIELD(fk_del_action);
 	COPY_NODE_FIELD(old_conpfeqop);
+	COPY_SCALAR_FIELD(old_pktable_oid);
 	COPY_SCALAR_FIELD(skip_validation);
 	COPY_SCALAR_FIELD(initially_valid);
 
@@ -3206,6 +3207,8 @@ _copyVacuumStmt(const VacuumStmt *from)
 	COPY_SCALAR_FIELD(options);
 	COPY_SCALAR_FIELD(freeze_min_age);
 	COPY_SCALAR_FIELD(freeze_table_age);
+	COPY_SCALAR_FIELD(multixact_freeze_min_age);
+	COPY_SCALAR_FIELD(multixact_freeze_table_age);
 	COPY_NODE_FIELD(relation);
 	COPY_NODE_FIELD(va_cols);
 

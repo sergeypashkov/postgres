@@ -65,8 +65,8 @@ extern uint32 bootstrap_data_checksum_version;
 /* File path names (all relative to $PGDATA) */
 #define RECOVERY_COMMAND_FILE	"recovery.conf"
 #define RECOVERY_COMMAND_DONE	"recovery.done"
-#define PROMOTE_SIGNAL_FILE "promote"
-#define FAST_PROMOTE_SIGNAL_FILE "fast_promote"
+#define PROMOTE_SIGNAL_FILE		"promote"
+#define FALLBACK_PROMOTE_SIGNAL_FILE "fallback_promote"
 
 
 /* User-settable parameters */
@@ -124,7 +124,7 @@ const struct config_enum_entry sync_method_options[] = {
 
 /*
  * Statistics for current checkpoint are collected in this global struct.
- * Because only the background writer or a stand-alone backend can perform
+ * Because only the checkpointer or a stand-alone backend can perform
  * checkpoints, this will be unused in normal backends.
  */
 CheckpointStatsData CheckpointStats;
@@ -2608,7 +2608,7 @@ XLogFileOpen(XLogSegNo segno)
 	if (fd < 0)
 		ereport(PANIC,
 				(errcode_for_file_access(),
-				 errmsg("could not open xlog file \"%s\": %m", path)));
+				 errmsg("could not open transaction log file \"%s\": %m", path)));
 
 	return fd;
 }
@@ -3739,6 +3739,10 @@ ReadControlFile(void)
 				  " but the server was compiled without USE_FLOAT8_BYVAL."),
 				 errhint("It looks like you need to recompile or initdb.")));
 #endif
+
+	/* Make the initdb settings visible as GUC variables, too */
+	SetConfigOption("data_checksums", DataChecksumsEnabled() ? "yes" : "no",
+					PGC_INTERNAL, PGC_S_OVERRIDE);
 }
 
 void
@@ -4529,7 +4533,7 @@ recoveryStopsHere(XLogRecord *record, bool *includeThis)
 
 		recordRestorePointData = (xl_restore_point *) XLogRecGetData(record);
 		recordXtime = recordRestorePointData->rp_time;
-		strncpy(recordRPName, recordRestorePointData->rp_name, MAXFNAMELEN);
+		strlcpy(recordRPName, recordRestorePointData->rp_name, MAXFNAMELEN);
 	}
 	else
 		return false;
@@ -4624,7 +4628,7 @@ recoveryStopsHere(XLogRecord *record, bool *includeThis)
 		}
 		else
 		{
-			strncpy(recoveryStopName, recordRPName, MAXFNAMELEN);
+			strlcpy(recoveryStopName, recordRPName, MAXFNAMELEN);
 
 			ereport(LOG,
 				(errmsg("recovery stopping at restore point \"%s\", time %s",
@@ -4957,7 +4961,7 @@ StartupXLOG(void)
 	 * Save archive_cleanup_command in shared memory so that other processes
 	 * can see it.
 	 */
-	strncpy(XLogCtl->archiveCleanupCommand,
+	strlcpy(XLogCtl->archiveCleanupCommand,
 			archiveCleanupCommand ? archiveCleanupCommand : "",
 			sizeof(XLogCtl->archiveCleanupCommand));
 
@@ -4997,7 +5001,7 @@ StartupXLOG(void)
 		ereport(ERROR,
 				(errcode(ERRCODE_OUT_OF_MEMORY),
 				 errmsg("out of memory"),
-			errdetail("Failed while allocating an XLog reading processor")));
+			errdetail("Failed while allocating an XLog reading processor.")));
 	xlogreader->system_identifier = ControlFile->system_identifier;
 
 	if (read_backup_label(&checkPointLoc, &backupEndRequired,
@@ -5140,7 +5144,7 @@ StartupXLOG(void)
 		ereport(FATAL,
 				(errmsg("requested timeline %u is not a child of this server's history",
 						recoveryTargetTLI),
-				 errdetail("Latest checkpoint is at %X/%X on timeline %u, but in the history of the requested timeline, the server forked off from that timeline at %X/%X",
+				 errdetail("Latest checkpoint is at %X/%X on timeline %u, but in the history of the requested timeline, the server forked off from that timeline at %X/%X.",
 						   (uint32) (ControlFile->checkPoint >> 32),
 						   (uint32) ControlFile->checkPoint,
 						   ControlFile->checkPointCopy.ThisTimeLineID,
@@ -5194,6 +5198,14 @@ StartupXLOG(void)
 	SetMultiXactIdLimit(checkPoint.oldestMulti, checkPoint.oldestMultiDB);
 	XLogCtl->ckptXidEpoch = checkPoint.nextXidEpoch;
 	XLogCtl->ckptXid = checkPoint.nextXid;
+
+	/*
+	 * Startup MultiXact.  We need to do this early for two reasons: one
+	 * is that we might try to access multixacts when we do tuple freezing,
+	 * and the other is we need its state initialized because we attempt
+	 * truncation during restartpoints.
+	 */
+	StartupMultiXact();
 
 	/*
 	 * Initialize unlogged LSN. On a clean shutdown, it's restored from the
@@ -5395,8 +5407,9 @@ StartupXLOG(void)
 			ProcArrayInitRecovery(ShmemVariableCache->nextXid);
 
 			/*
-			 * Startup commit log and subtrans only. Other SLRUs are not
-			 * maintained during recovery and need not be started yet.
+			 * Startup commit log and subtrans only. MultiXact has already
+			 * been started up and other SLRUs are not maintained during
+			 * recovery and need not be started yet.
 			 */
 			StartupCLOG();
 			StartupSUBTRANS(oldestActiveXID);
@@ -5443,21 +5456,13 @@ StartupXLOG(void)
 		}
 
 		/*
-		 * Initialize shared replayEndRecPtr, lastReplayedEndRecPtr, and
-		 * recoveryLastXTime.
-		 *
-		 * This is slightly confusing if we're starting from an online
-		 * checkpoint; we've just read and replayed the checkpoint record, but
-		 * we're going to start replay from its redo pointer, which precedes
-		 * the location of the checkpoint record itself. So even though the
-		 * last record we've replayed is indeed ReadRecPtr, we haven't
-		 * replayed all the preceding records yet. That's OK for the current
-		 * use of these variables.
+		 * Initialize shared variables for tracking progress of WAL replay,
+		 * as if we had just replayed the record before the REDO location.
 		 */
 		SpinLockAcquire(&xlogctl->info_lck);
-		xlogctl->replayEndRecPtr = ReadRecPtr;
+		xlogctl->replayEndRecPtr = checkPoint.redo;
 		xlogctl->replayEndTLI = ThisTimeLineID;
-		xlogctl->lastReplayedEndRecPtr = EndRecPtr;
+		xlogctl->lastReplayedEndRecPtr = checkPoint.redo;
 		xlogctl->lastReplayedTLI = ThisTimeLineID;
 		xlogctl->recoveryLastXTime = 0;
 		xlogctl->currentChunkStartTime = 0;
@@ -5573,11 +5578,6 @@ StartupXLOG(void)
 				 */
 				if (recoveryStopsHere(record, &recoveryApply))
 				{
-					if (recoveryPauseAtTarget)
-					{
-						SetRecoveryPause(true);
-						recoveryPausesHere();
-					}
 					reachedStopPoint = true;	/* see below */
 					recoveryContinue = false;
 
@@ -5707,6 +5707,12 @@ StartupXLOG(void)
 			/*
 			 * end of main redo apply loop
 			 */
+
+			if (recoveryPauseAtTarget && reachedStopPoint)
+			{
+				SetRecoveryPause(true);
+				recoveryPausesHere();
+			}
 
 			ereport(LOG,
 					(errmsg("redo done at %X/%X",
@@ -6061,8 +6067,8 @@ StartupXLOG(void)
 	/*
 	 * Perform end of recovery actions for any SLRUs that need it.
 	 */
-	StartupMultiXact();
 	TrimCLOG();
+	TrimMultiXact();
 
 	/* Reload shared-memory state for prepared transactions */
 	RecoverPreparedTransactions();
@@ -6128,6 +6134,8 @@ StartupXLOG(void)
 static void
 CheckRecoveryConsistency(void)
 {
+	XLogRecPtr lastReplayedEndRecPtr;
+
 	/*
 	 * During crash recovery, we don't reach a consistent state until we've
 	 * replayed all the WAL.
@@ -6136,10 +6144,16 @@ CheckRecoveryConsistency(void)
 		return;
 
 	/*
+	 * assume that we are called in the startup process, and hence don't need
+	 * a lock to read lastReplayedEndRecPtr
+	 */
+	lastReplayedEndRecPtr = XLogCtl->lastReplayedEndRecPtr;
+
+	/*
 	 * Have we reached the point where our base backup was completed?
 	 */
 	if (!XLogRecPtrIsInvalid(ControlFile->backupEndPoint) &&
-		ControlFile->backupEndPoint <= EndRecPtr)
+		ControlFile->backupEndPoint <= lastReplayedEndRecPtr)
 	{
 		/*
 		 * We have reached the end of base backup, as indicated by pg_control.
@@ -6152,8 +6166,8 @@ CheckRecoveryConsistency(void)
 
 		LWLockAcquire(ControlFileLock, LW_EXCLUSIVE);
 
-		if (ControlFile->minRecoveryPoint < EndRecPtr)
-			ControlFile->minRecoveryPoint = EndRecPtr;
+		if (ControlFile->minRecoveryPoint < lastReplayedEndRecPtr)
+			ControlFile->minRecoveryPoint = lastReplayedEndRecPtr;
 
 		ControlFile->backupStartPoint = InvalidXLogRecPtr;
 		ControlFile->backupEndPoint = InvalidXLogRecPtr;
@@ -6171,7 +6185,7 @@ CheckRecoveryConsistency(void)
 	 * consistent yet.
 	 */
 	if (!reachedConsistency && !ControlFile->backupEndRequired &&
-		minRecoveryPoint <= XLogCtl->lastReplayedEndRecPtr &&
+		minRecoveryPoint <= lastReplayedEndRecPtr &&
 		XLogRecPtrIsInvalid(ControlFile->backupStartPoint))
 	{
 		/*
@@ -6183,8 +6197,8 @@ CheckRecoveryConsistency(void)
 		reachedConsistency = true;
 		ereport(LOG,
 				(errmsg("consistent recovery state reached at %X/%X",
-						(uint32) (XLogCtl->lastReplayedEndRecPtr >> 32),
-						(uint32) XLogCtl->lastReplayedEndRecPtr)));
+						(uint32) (lastReplayedEndRecPtr >> 32),
+						(uint32) lastReplayedEndRecPtr)));
 	}
 
 	/*
@@ -6258,7 +6272,8 @@ RecoveryInProgress(void)
  * true. Postmaster knows this by way of signal, not via shared memory.
  *
  * Unlike testing standbyState, this works in any process that's connected to
- * shared memory.
+ * shared memory.  (And note that standbyState alone doesn't tell the truth
+ * anyway.)
  */
 bool
 HotStandbyActive(void)
@@ -6282,6 +6297,17 @@ HotStandbyActive(void)
 
 		return LocalHotStandbyActive;
 	}
+}
+
+/*
+ * Like HotStandbyActive(), but to be used only in WAL replay code,
+ * where we don't need to ask any other process what the state is.
+ */
+bool
+HotStandbyActiveInReplay(void)
+{
+	Assert(AmStartupProcess());
+	return LocalHotStandbyActive;
 }
 
 /*
@@ -7460,6 +7486,21 @@ CreateRestartPoint(int flags)
 	LWLockRelease(ControlFileLock);
 
 	/*
+	 * Due to an historical accident multixact truncations are not WAL-logged,
+	 * but just performed everytime the mxact horizon is increased. So, unless
+	 * we explicitly execute truncations on a standby it will never clean out
+	 * /pg_multixact which obviously is bad, both because it uses space and
+	 * because we can wrap around into pre-existing data...
+	 *
+	 * We can only do the truncation here, after the UpdateControlFile()
+	 * above, because we've now safely established a restart point, that
+	 * guarantees we will not need need to access those multis.
+	 *
+	 * It's probably worth improving this.
+	 */
+	TruncateMultiXact(lastCheckPoint.oldestMulti);
+
+	/*
 	 * Delete old log files (those no longer needed even for previous
 	 * checkpoint/restartpoint) to prevent the disk holding the xlog from
 	 * growing full.
@@ -7648,7 +7689,7 @@ XLogRestorePoint(const char *rpName)
 	xl_restore_point xlrec;
 
 	xlrec.rp_time = GetCurrentTimestamp();
-	strncpy(xlrec.rp_name, rpName, MAXFNAMELEN);
+	strlcpy(xlrec.rp_name, rpName, MAXFNAMELEN);
 
 	rdata.buffer = InvalidBuffer;
 	rdata.data = (char *) &xlrec;
@@ -7873,7 +7914,7 @@ checkTimeLineSwitch(XLogRecPtr lsn, TimeLineID newTLI, TimeLineID prevTLI)
 	/* Check that the record agrees on what the current (old) timeline is */
 	if (prevTLI != ThisTimeLineID)
 		ereport(PANIC,
-				(errmsg("unexpected prev timeline ID %u (current timeline ID %u) in checkpoint record",
+				(errmsg("unexpected previous timeline ID %u (current timeline ID %u) in checkpoint record",
 						prevTLI, ThisTimeLineID)));
 
 	/*
@@ -8420,6 +8461,9 @@ XLogFileNameP(TimeLineID tli, XLogSegNo segno)
  *
  * Every successfully started non-exclusive backup must be stopped by calling
  * do_pg_stop_backup() or do_pg_abort_backup().
+ *
+ * It is the responsibility of the caller of this function to verify the
+ * permissions of the calling user!
  */
 XLogRecPtr
 do_pg_start_backup(const char *backupidstr, bool fast, TimeLineID *starttli_p,
@@ -8439,11 +8483,6 @@ do_pg_start_backup(const char *backupidstr, bool fast, TimeLineID *starttli_p,
 	StringInfoData labelfbuf;
 
 	backup_started_in_recovery = RecoveryInProgress();
-
-	if (!superuser() && !has_rolreplication(GetUserId()))
-		ereport(ERROR,
-				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-		   errmsg("must be superuser or replication role to run a backup")));
 
 	/*
 	 * Currently only non-exclusive backup can be taken during recovery.
@@ -8746,6 +8785,9 @@ pg_start_backup_callback(int code, Datum arg)
  *
  * Returns the last WAL position that must be present to restore from this
  * backup, and the corresponding timeline ID in *stoptli_p.
+ *
+ * It is the responsibility of the caller of this function to verify the
+ * permissions of the calling user!
  */
 XLogRecPtr
 do_pg_stop_backup(char *labelfile, bool waitforarchive, TimeLineID *stoptli_p)
@@ -8777,11 +8819,6 @@ do_pg_stop_backup(char *labelfile, bool waitforarchive, TimeLineID *stoptli_p)
 				lo;
 
 	backup_started_in_recovery = RecoveryInProgress();
-
-	if (!superuser() && !has_rolreplication(GetUserId()))
-		ereport(ERROR,
-				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-		 (errmsg("must be superuser or replication role to run a backup"))));
 
 	/*
 	 * Currently only non-exclusive backup can be taken during recovery.
@@ -9543,17 +9580,15 @@ WaitForWALToBecomeAvailable(XLogRecPtr RecPtr, bool randAccess,
 	/*-------
 	 * Standby mode is implemented by a state machine:
 	 *
-	 * 1. Read from archive (XLOG_FROM_ARCHIVE)
-	 * 2. Read from pg_xlog (XLOG_FROM_PG_XLOG)
-	 * 3. Check trigger file
-	 * 4. Read from primary server via walreceiver (XLOG_FROM_STREAM)
-	 * 5. Rescan timelines
-	 * 6. Sleep 5 seconds, and loop back to 1.
+	 * 1. Read from either archive or pg_xlog (XLOG_FROM_ARCHIVE), or just
+	 *    pg_xlog (XLOG_FROM_XLOG)
+	 * 2. Check trigger file
+	 * 3. Read from primary server via walreceiver (XLOG_FROM_STREAM)
+	 * 4. Rescan timelines
+	 * 5. Sleep 5 seconds, and loop back to 1.
 	 *
 	 * Failure to read from the current source advances the state machine to
-	 * the next state. In addition, successfully reading a file from pg_xlog
-	 * moves the state machine from state 2 back to state 1 (we always prefer
-	 * files in the archive over files in pg_xlog).
+	 * the next state.
 	 *
 	 * 'currentSource' indicates the current state. There are no currentSource
 	 * values for "check trigger", "rescan timelines", and "sleep" states,
@@ -9581,9 +9616,6 @@ WaitForWALToBecomeAvailable(XLogRecPtr RecPtr, bool randAccess,
 			switch (currentSource)
 			{
 				case XLOG_FROM_ARCHIVE:
-					currentSource = XLOG_FROM_PG_XLOG;
-					break;
-
 				case XLOG_FROM_PG_XLOG:
 
 					/*
@@ -9748,7 +9780,9 @@ WaitForWALToBecomeAvailable(XLogRecPtr RecPtr, bool randAccess,
 				 * Try to restore the file from archive, or read an existing
 				 * file from pg_xlog.
 				 */
-				readFile = XLogFileReadAnyTLI(readSegNo, DEBUG2, currentSource);
+				readFile = XLogFileReadAnyTLI(readSegNo, DEBUG2,
+						currentSource == XLOG_FROM_ARCHIVE ? XLOG_FROM_ANY :
+										 currentSource);
 				if (readFile >= 0)
 					return true;	/* success! */
 
@@ -9927,19 +9961,20 @@ CheckForStandbyTrigger(void)
 	{
 		/*
 		 * In 9.1 and 9.2 the postmaster unlinked the promote file inside the
-		 * signal handler. We now leave the file in place and let the Startup
-		 * process do the unlink. This allows Startup to know whether we're
-		 * doing fast or normal promotion. Fast promotion takes precedence.
+		 * signal handler. It now leaves the file in place and lets the
+		 * Startup process do the unlink. This allows Startup to know whether
+		 * it should create a full checkpoint before starting up (fallback
+		 * mode). Fast promotion takes precedence.
 		 */
-		if (stat(FAST_PROMOTE_SIGNAL_FILE, &stat_buf) == 0)
+		if (stat(PROMOTE_SIGNAL_FILE, &stat_buf) == 0)
 		{
-			unlink(FAST_PROMOTE_SIGNAL_FILE);
 			unlink(PROMOTE_SIGNAL_FILE);
+			unlink(FALLBACK_PROMOTE_SIGNAL_FILE);
 			fast_promote = true;
 		}
-		else if (stat(PROMOTE_SIGNAL_FILE, &stat_buf) == 0)
+		else if (stat(FALLBACK_PROMOTE_SIGNAL_FILE, &stat_buf) == 0)
 		{
-			unlink(PROMOTE_SIGNAL_FILE);
+			unlink(FALLBACK_PROMOTE_SIGNAL_FILE);
 			fast_promote = false;
 		}
 
@@ -9975,7 +10010,7 @@ CheckPromoteSignal(void)
 	struct stat stat_buf;
 
 	if (stat(PROMOTE_SIGNAL_FILE, &stat_buf) == 0 ||
-		stat(FAST_PROMOTE_SIGNAL_FILE, &stat_buf) == 0)
+		stat(FALLBACK_PROMOTE_SIGNAL_FILE, &stat_buf) == 0)
 		return true;
 
 	return false;

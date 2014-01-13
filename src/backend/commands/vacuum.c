@@ -55,6 +55,8 @@
  */
 int			vacuum_freeze_min_age;
 int			vacuum_freeze_table_age;
+int			vacuum_multixact_freeze_min_age;
+int			vacuum_multixact_freeze_table_age;
 
 
 /* A few variables that don't seem worth passing around as parameters */
@@ -64,7 +66,7 @@ static BufferAccessStrategy vac_strategy;
 
 /* non-export function prototypes */
 static List *get_rel_oids(Oid relid, const RangeVar *vacrel);
-static void vac_truncate_clog(TransactionId frozenXID, MultiXactId frozenMulti);
+static void vac_truncate_clog(TransactionId frozenXID, MultiXactId minMulti);
 static bool vacuum_rel(Oid relid, VacuumStmt *vacstmt, bool do_toast,
 		   bool for_wraparound);
 
@@ -376,19 +378,43 @@ get_rel_oids(Oid relid, const RangeVar *vacrel)
 
 /*
  * vacuum_set_xid_limits() -- compute oldest-Xmin and freeze cutoff points
+ *
+ * The output parameters are:
+ * - oldestXmin is the cutoff value used to distinguish whether tuples are
+ *   DEAD or RECENTLY_DEAD (see HeapTupleSatisfiesVacuum).
+ * - freezeLimit is the Xid below which all Xids are replaced by
+ *   FrozenTransactionId during vacuum.
+ * - xidFullScanLimit (computed from the the table_freeze_age parameter)
+ *   represents a minimum Xid value; a table whose relfrozenxid is older than
+ *   this will have a full-table vacuum applied to it, to freeze tuples across
+ *   the whole table.  Vacuuming a table younger than this value can use a
+ *   partial scan.
+ * - multiXactCutoff is the value below which all MultiXactIds are removed from
+ *   Xmax.
+ * - mxactFullScanLimit is a value against which a table's relminmxid value is
+ *   compared to produce a full-table vacuum, as with xidFullScanLimit.
+ *
+ * xidFullScanLimit and mxactFullScanLimit can be passed as NULL if caller is
+ * not interested.
  */
 void
 vacuum_set_xid_limits(int freeze_min_age,
 					  int freeze_table_age,
+					  int multixact_freeze_min_age,
+					  int multixact_freeze_table_age,
 					  bool sharedRel,
 					  TransactionId *oldestXmin,
 					  TransactionId *freezeLimit,
-					  TransactionId *freezeTableLimit,
-					  MultiXactId *multiXactFrzLimit)
+					  TransactionId *xidFullScanLimit,
+					  MultiXactId *multiXactCutoff,
+					  MultiXactId *mxactFullScanLimit)
 {
 	int			freezemin;
+	int			mxid_freezemin;
 	TransactionId limit;
 	TransactionId safeLimit;
+	MultiXactId mxactLimit;
+	MultiXactId safeMxactLimit;
 
 	/*
 	 * We can always ignore processes running lazy vacuum.	This is because we
@@ -441,9 +467,44 @@ vacuum_set_xid_limits(int freeze_min_age,
 
 	*freezeLimit = limit;
 
-	if (freezeTableLimit != NULL)
+	/*
+	 * Determine the minimum multixact freeze age to use: as specified by
+	 * caller, or vacuum_multixact_freeze_min_age, but in any case not more
+	 * than half autovacuum_multixact_freeze_max_age, so that autovacuums to
+	 * prevent MultiXact wraparound won't occur too frequently.
+	 */
+	mxid_freezemin = multixact_freeze_min_age;
+	if (mxid_freezemin < 0)
+		mxid_freezemin = vacuum_multixact_freeze_min_age;
+	mxid_freezemin = Min(mxid_freezemin,
+						 autovacuum_multixact_freeze_max_age / 2);
+	Assert(mxid_freezemin >= 0);
+
+	/* compute the cutoff multi, being careful to generate a valid value */
+	mxactLimit = GetOldestMultiXactId() - mxid_freezemin;
+	if (mxactLimit < FirstMultiXactId)
+		mxactLimit = FirstMultiXactId;
+
+	safeMxactLimit =
+		ReadNextMultiXactId() - autovacuum_multixact_freeze_max_age;
+	if (safeMxactLimit < FirstMultiXactId)
+		safeMxactLimit = FirstMultiXactId;
+
+	if (MultiXactIdPrecedes(mxactLimit, safeMxactLimit))
+	{
+		ereport(WARNING,
+				(errmsg("oldest multixact is far in the past"),
+				 errhint("Close open transactions with multixacts soon to avoid wraparound problems.")));
+		mxactLimit = safeMxactLimit;
+	}
+
+	*multiXactCutoff = mxactLimit;
+
+	if (xidFullScanLimit != NULL)
 	{
 		int			freezetable;
+
+		Assert(mxactFullScanLimit != NULL);
 
 		/*
 		 * Determine the table freeze age to use: as specified by the caller,
@@ -459,29 +520,43 @@ vacuum_set_xid_limits(int freeze_min_age,
 		Assert(freezetable >= 0);
 
 		/*
-		 * Compute the cutoff XID, being careful not to generate a "permanent"
-		 * XID.
+		 * Compute XID limit causing a full-table vacuum, being careful not to
+		 * generate a "permanent" XID.
 		 */
 		limit = ReadNewTransactionId() - freezetable;
 		if (!TransactionIdIsNormal(limit))
 			limit = FirstNormalTransactionId;
 
-		*freezeTableLimit = limit;
-	}
-
-	if (multiXactFrzLimit != NULL)
-	{
-		MultiXactId mxLimit;
+		*xidFullScanLimit = limit;
 
 		/*
-		 * simplistic multixactid freezing: use the same freezing policy as
-		 * for Xids
+		 * Similar to the above, determine the table freeze age to use for
+		 * multixacts: as specified by the caller, or
+		 * vacuum_multixact_freeze_table_age, but in any case not more than
+		 * autovacuum_multixact_freeze_table_age * 0.95, so that if you have
+		 * e.g. nightly VACUUM schedule, the nightly VACUUM gets a chance to
+		 * freeze multixacts before anti-wraparound autovacuum is launched.
 		 */
-		mxLimit = GetOldestMultiXactId() - freezemin;
-		if (mxLimit < FirstMultiXactId)
-			mxLimit = FirstMultiXactId;
+		freezetable = multixact_freeze_table_age;
+		if (freezetable < 0)
+			freezetable = vacuum_multixact_freeze_table_age;
+		freezetable = Min(freezetable,
+						  autovacuum_multixact_freeze_max_age * 0.95);
+		Assert(freezetable >= 0);
 
-		*multiXactFrzLimit = mxLimit;
+		/*
+		 * Compute MultiXact limit causing a full-table vacuum, being careful
+		 * to generate a valid MultiXact value.
+		 */
+		mxactLimit = ReadNextMultiXactId() - freezetable;
+		if (mxactLimit < FirstMultiXactId)
+			mxactLimit = FirstMultiXactId;
+
+		*mxactFullScanLimit = mxactLimit;
+	}
+	else
+	{
+		Assert(mxactFullScanLimit == NULL);
 	}
 }
 
@@ -690,8 +765,8 @@ vac_update_relstats(Relation relation,
  *		Update pg_database's datfrozenxid entry for our database to be the
  *		minimum of the pg_class.relfrozenxid values.
  *
- *		Similarly, update our datfrozenmulti to be the minimum of the
- *		pg_class.relfrozenmulti values.
+ *		Similarly, update our datminmxid to be the minimum of the
+ *		pg_class.relminmxid values.
  *
  *		If we are able to advance either pg_database value, also try to
  *		truncate pg_clog and pg_multixact.
@@ -711,7 +786,7 @@ vac_update_datfrozenxid(void)
 	SysScanDesc scan;
 	HeapTuple	classTup;
 	TransactionId newFrozenXid;
-	MultiXactId newFrozenMulti;
+	MultiXactId newMinMulti;
 	bool		dirty = false;
 
 	/*
@@ -726,7 +801,7 @@ vac_update_datfrozenxid(void)
 	 * Similarly, initialize the MultiXact "min" with the value that would be
 	 * used on pg_class for new tables.  See AddNewRelationTuple().
 	 */
-	newFrozenMulti = GetOldestMultiXactId();
+	newMinMulti = GetOldestMultiXactId();
 
 	/*
 	 * We must seqscan pg_class to find the minimum Xid, because there is no
@@ -742,8 +817,8 @@ vac_update_datfrozenxid(void)
 		Form_pg_class classForm = (Form_pg_class) GETSTRUCT(classTup);
 
 		/*
-		 * Only consider heap and TOAST tables (anything else should have
-		 * InvalidTransactionId in relfrozenxid anyway.)
+		 * Only consider relations able to hold unfrozen XIDs (anything else
+		 * should have InvalidTransactionId in relfrozenxid anyway.)
 		 */
 		if (classForm->relkind != RELKIND_RELATION &&
 			classForm->relkind != RELKIND_MATVIEW &&
@@ -756,8 +831,8 @@ vac_update_datfrozenxid(void)
 		if (TransactionIdPrecedes(classForm->relfrozenxid, newFrozenXid))
 			newFrozenXid = classForm->relfrozenxid;
 
-		if (MultiXactIdPrecedes(classForm->relminmxid, newFrozenMulti))
-			newFrozenMulti = classForm->relminmxid;
+		if (MultiXactIdPrecedes(classForm->relminmxid, newMinMulti))
+			newMinMulti = classForm->relminmxid;
 	}
 
 	/* we're done with pg_class */
@@ -765,7 +840,7 @@ vac_update_datfrozenxid(void)
 	heap_close(relation, AccessShareLock);
 
 	Assert(TransactionIdIsNormal(newFrozenXid));
-	Assert(MultiXactIdIsValid(newFrozenMulti));
+	Assert(MultiXactIdIsValid(newMinMulti));
 
 	/* Now fetch the pg_database tuple we need to update. */
 	relation = heap_open(DatabaseRelationId, RowExclusiveLock);
@@ -787,9 +862,9 @@ vac_update_datfrozenxid(void)
 	}
 
 	/* ditto */
-	if (MultiXactIdPrecedes(dbform->datminmxid, newFrozenMulti))
+	if (MultiXactIdPrecedes(dbform->datminmxid, newMinMulti))
 	{
-		dbform->datminmxid = newFrozenMulti;
+		dbform->datminmxid = newMinMulti;
 		dirty = true;
 	}
 
@@ -805,7 +880,7 @@ vac_update_datfrozenxid(void)
 	 * this action will update that too.
 	 */
 	if (dirty || ForceTransactionIdLimitUpdate())
-		vac_truncate_clog(newFrozenXid, newFrozenMulti);
+		vac_truncate_clog(newFrozenXid, newMinMulti);
 }
 
 
@@ -824,19 +899,19 @@ vac_update_datfrozenxid(void)
  *		info is stale.
  */
 static void
-vac_truncate_clog(TransactionId frozenXID, MultiXactId frozenMulti)
+vac_truncate_clog(TransactionId frozenXID, MultiXactId minMulti)
 {
 	TransactionId myXID = GetCurrentTransactionId();
 	Relation	relation;
 	HeapScanDesc scan;
 	HeapTuple	tuple;
 	Oid			oldestxid_datoid;
-	Oid			oldestmulti_datoid;
+	Oid			minmulti_datoid;
 	bool		frozenAlreadyWrapped = false;
 
 	/* init oldest datoids to sync with my frozen values */
 	oldestxid_datoid = MyDatabaseId;
-	oldestmulti_datoid = MyDatabaseId;
+	minmulti_datoid = MyDatabaseId;
 
 	/*
 	 * Scan pg_database to compute the minimum datfrozenxid
@@ -869,10 +944,10 @@ vac_truncate_clog(TransactionId frozenXID, MultiXactId frozenMulti)
 			oldestxid_datoid = HeapTupleGetOid(tuple);
 		}
 
-		if (MultiXactIdPrecedes(dbform->datminmxid, frozenMulti))
+		if (MultiXactIdPrecedes(dbform->datminmxid, minMulti))
 		{
-			frozenMulti = dbform->datminmxid;
-			oldestmulti_datoid = HeapTupleGetOid(tuple);
+			minMulti = dbform->datminmxid;
+			minmulti_datoid = HeapTupleGetOid(tuple);
 		}
 	}
 
@@ -896,7 +971,7 @@ vac_truncate_clog(TransactionId frozenXID, MultiXactId frozenMulti)
 
 	/* Truncate CLOG and Multi to the oldest computed value */
 	TruncateCLOG(frozenXID);
-	TruncateMultiXact(frozenMulti);
+	TruncateMultiXact(minMulti);
 
 	/*
 	 * Update the wrap limit for GetNewTransactionId and creation of new
@@ -905,7 +980,7 @@ vac_truncate_clog(TransactionId frozenXID, MultiXactId frozenMulti)
 	 * signalling twice?
 	 */
 	SetTransactionIdLimit(frozenXID, oldestxid_datoid);
-	MultiXactAdvanceOldest(frozenMulti, oldestmulti_datoid);
+	MultiXactAdvanceOldest(minMulti, minmulti_datoid);
 }
 
 
@@ -1044,7 +1119,7 @@ vacuum_rel(Oid relid, VacuumStmt *vacstmt, bool do_toast, bool for_wraparound)
 	}
 
 	/*
-	 * Check that it's a vacuumable table; we used to do this in
+	 * Check that it's a vacuumable relation; we used to do this in
 	 * get_rel_oids() but seems safer to check after we've locked the
 	 * relation.
 	 */
@@ -1122,7 +1197,9 @@ vacuum_rel(Oid relid, VacuumStmt *vacstmt, bool do_toast, bool for_wraparound)
 		/* VACUUM FULL is now a variant of CLUSTER; see cluster.c */
 		cluster_rel(relid, InvalidOid, false,
 					(vacstmt->options & VACOPT_VERBOSE) != 0,
-					vacstmt->freeze_min_age, vacstmt->freeze_table_age);
+					vacstmt->freeze_min_age, vacstmt->freeze_table_age,
+					vacstmt->multixact_freeze_min_age,
+					vacstmt->multixact_freeze_table_age);
 	}
 	else
 		lazy_vacuum_rel(onerel, vacstmt, vac_strategy);
