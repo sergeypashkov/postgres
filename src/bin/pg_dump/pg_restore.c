@@ -61,20 +61,22 @@ extern int	optind;
 #include <locale.h>
 #endif
 
+#include "pg_backup_utils.h"
 
 static void usage(const char *progname);
 
 typedef struct option optType;
 
-int
-main(int argc, char **argv)
+static int pg_restore_internal( int argc, const char** argv, char** outMsgBuf )
 {
 	RestoreOptions *opts;
 	int			c;
 	int			exit_code;
 	int			numWorkers = 1;
 	Archive    *AH;
+    ArchiveHandle *AHDL;
 	char	   *inputFileSpec;
+    const char *password = NULL;
 	static int	disable_triggers = 0;
 	static int	no_data_for_failed_tables = 0;
 	static int	outputNoTablespaces = 0;
@@ -100,7 +102,7 @@ main(int argc, char **argv)
 		{"no-owner", 0, NULL, 'O'},
 		{"no-reconnect", 0, NULL, 'R'},
 		{"port", 1, NULL, 'p'},
-		{"no-password", 0, NULL, 'w'},
+		{"no-password", required_argument, NULL, 'w'},
 		{"password", 0, NULL, 'W'},
 		{"schema", 1, NULL, 'n'},
 		{"schema-only", 0, NULL, 's'},
@@ -126,11 +128,20 @@ main(int argc, char **argv)
 		{NULL, 0, NULL, 0}
 	};
 
+    // Reset getopt_long
+    optind = 1;
+    optarg = NULL;
+    
+    CleanDumpable();
+    
+    g_outMsgBuf = outMsgBuf;
+    
 	set_pglocale_pgservice(argv[0], PG_TEXTDOMAIN("pg_dump"));
 
 	init_parallel_dump_utils();
 
 	opts = NewRestoreOptions();
+    opts->promptPassword = TRI_NO;
 
 	progname = get_progname(argv[0]);
 
@@ -139,16 +150,16 @@ main(int argc, char **argv)
 		if (strcmp(argv[1], "--help") == 0 || strcmp(argv[1], "-?") == 0)
 		{
 			usage(progname);
-			exit_nicely(0);
+			exit_nicely(1);
 		}
 		if (strcmp(argv[1], "--version") == 0 || strcmp(argv[1], "-V") == 0)
 		{
-			puts("pg_restore (PostgreSQL) " PG_VERSION);
-			exit_nicely(0);
+            write_msg( NULL, "pg_restore (PostgreSQL) %s", PG_VERSION);
+			exit_nicely(1);
 		}
 	}
 
-	while ((c = getopt_long(argc, argv, "acCd:ef:F:h:iI:j:lL:n:Op:P:RsS:t:T:U:vwWx1",
+	while ((c = getopt_long(argc, argv, "acCd:ef:F:h:iI:j:lL:n:Op:P:RsS:t:T:U:vw:Wx1",
 							cmdopts, NULL)) != -1)
 	{
 		switch (c)
@@ -247,11 +258,13 @@ main(int argc, char **argv)
 				break;
 
 			case 'w':
+                password = optarg;
 				opts->promptPassword = TRI_NO;
 				break;
 
 			case 'W':
-				opts->promptPassword = TRI_YES;
+                // NOT AVAILABLE
+				// opts->promptPassword = TRI_YES;
 				break;
 
 			case 'x':			/* skip ACL dump */
@@ -279,7 +292,7 @@ main(int argc, char **argv)
 				break;
 
 			default:
-				fprintf(stderr, _("Try \"%s --help\" for more information.\n"), progname);
+				write_msg( NULL, _("Try \"%s --help\" for more information.\n"), progname);
 				exit_nicely(1);
 		}
 	}
@@ -293,10 +306,10 @@ main(int argc, char **argv)
 	/* Complain if any arguments remain */
 	if (optind < argc)
 	{
-		fprintf(stderr, _("%s: too many command-line arguments (first is \"%s\")\n"),
-				progname, argv[optind]);
-		fprintf(stderr, _("Try \"%s --help\" for more information.\n"),
-				progname);
+        write_msg( NULL, _("%s: too many command-line arguments (first is \"%s\")\n"),
+                  progname, argv[optind]);
+		write_msg( NULL, _("Try \"%s --help\" for more information.\n"),
+                  progname);
 		exit_nicely(1);
 	}
 
@@ -305,10 +318,10 @@ main(int argc, char **argv)
 	{
 		if (opts->filename)
 		{
-			fprintf(stderr, _("%s: options -d/--dbname and -f/--file cannot be used together\n"),
-					progname);
-			fprintf(stderr, _("Try \"%s --help\" for more information.\n"),
-					progname);
+			write_msg( NULL, _("%s: options -d/--dbname and -f/--file cannot be used together\n"),
+                      progname);
+			write_msg( NULL, _("Try \"%s --help\" for more information.\n"),
+                      progname);
 			exit_nicely(1);
 		}
 		opts->useDB = 1;
@@ -317,8 +330,8 @@ main(int argc, char **argv)
 	/* Can't do single-txn mode with multiple connections */
 	if (opts->single_txn && numWorkers > 1)
 	{
-		fprintf(stderr, _("%s: cannot specify both --single-transaction and multiple jobs\n"),
-				progname);
+        write_msg( NULL, _("%s: cannot specify both --single-transaction and multiple jobs\n"),
+                  progname);
 		exit_nicely(1);
 	}
 
@@ -365,6 +378,9 @@ main(int argc, char **argv)
 
 	/* Let the archiver know how noisy to be */
 	AH->verbose = opts->verbose;
+    
+    AHDL = (ArchiveHandle *) AH;
+	AHDL->savedPassword = password;
 
 	/*
 	 * Whether to keep submitting sql commands as "pg_restore ... | psql ... "
@@ -396,69 +412,92 @@ main(int argc, char **argv)
 
 	/* done, print a summary of ignored errors */
 	if (AH->n_errors)
-		fprintf(stderr, _("WARNING: errors ignored on restore: %d\n"),
-				AH->n_errors);
+		write_msg( NULL, _("WARNING: errors ignored on restore: %d\n"),
+                  AH->n_errors);
 
 	/* AH may be freed in CloseArchive? */
 	exit_code = AH->n_errors ? 1 : 0;
 
 	CloseArchive(AH);
 
-	return exit_code;
+	return 1;
+}
+                  
+int pg_restore( int argc, const char** argv, char** outMsgBuf )
+{
+    int res = 1;
+    
+    jmp_buf env;
+    g_jmpEnv = &env;
+    
+    if( setjmp( env ) == 0 )
+    {
+        pg_restore_internal( argc, argv, outMsgBuf );
+    }
+    else
+    {
+        res = 0;
+    }
+    
+    g_jmpEnv = NULL;
+    
+    return res;
 }
 
 static void
 usage(const char *progname)
 {
-	printf(_("%s restores a PostgreSQL database from an archive created by pg_dump.\n\n"), progname);
-	printf(_("Usage:\n"));
-	printf(_("  %s [OPTION]... [FILE]\n"), progname);
-
-	printf(_("\nGeneral options:\n"));
-	printf(_("  -d, --dbname=NAME        connect to database name\n"));
-	printf(_("  -f, --file=FILENAME      output file name\n"));
-	printf(_("  -F, --format=c|d|t       backup file format (should be automatic)\n"));
-	printf(_("  -l, --list               print summarized TOC of the archive\n"));
-	printf(_("  -v, --verbose            verbose mode\n"));
-	printf(_("  -V, --version            output version information, then exit\n"));
-	printf(_("  -?, --help               show this help, then exit\n"));
-
-	printf(_("\nOptions controlling the restore:\n"));
-	printf(_("  -a, --data-only              restore only the data, no schema\n"));
-	printf(_("  -c, --clean                  clean (drop) database objects before recreating\n"));
-	printf(_("  -C, --create                 create the target database\n"));
-	printf(_("  -e, --exit-on-error          exit on error, default is to continue\n"));
-	printf(_("  -I, --index=NAME             restore named index\n"));
-	printf(_("  -j, --jobs=NUM               use this many parallel jobs to restore\n"));
-	printf(_("  -L, --use-list=FILENAME      use table of contents from this file for\n"
-			 "                               selecting/ordering output\n"));
-	printf(_("  -n, --schema=NAME            restore only objects in this schema\n"));
-	printf(_("  -O, --no-owner               skip restoration of object ownership\n"));
-	printf(_("  -P, --function=NAME(args)    restore named function\n"));
-	printf(_("  -s, --schema-only            restore only the schema, no data\n"));
-	printf(_("  -S, --superuser=NAME         superuser user name to use for disabling triggers\n"));
-	printf(_("  -t, --table=NAME             restore named table(s)\n"));
-	printf(_("  -T, --trigger=NAME           restore named trigger\n"));
-	printf(_("  -x, --no-privileges          skip restoration of access privileges (grant/revoke)\n"));
-	printf(_("  -1, --single-transaction     restore as a single transaction\n"));
-	printf(_("  --disable-triggers           disable triggers during data-only restore\n"));
-	printf(_("  --no-data-for-failed-tables  do not restore data of tables that could not be\n"
-			 "                               created\n"));
-	printf(_("  --no-security-labels         do not restore security labels\n"));
-	printf(_("  --no-tablespaces             do not restore tablespace assignments\n"));
-	printf(_("  --section=SECTION            restore named section (pre-data, data, or post-data)\n"));
-	printf(_("  --use-set-session-authorization\n"
-			 "                               use SET SESSION AUTHORIZATION commands instead of\n"
-			 "                               ALTER OWNER commands to set ownership\n"));
-
-	printf(_("\nConnection options:\n"));
-	printf(_("  -h, --host=HOSTNAME      database server host or socket directory\n"));
-	printf(_("  -p, --port=PORT          database server port number\n"));
-	printf(_("  -U, --username=NAME      connect as specified database user\n"));
-	printf(_("  -w, --no-password        never prompt for password\n"));
-	printf(_("  -W, --password           force password prompt (should happen automatically)\n"));
-	printf(_("  --role=ROLENAME          do SET ROLE before restore\n"));
-
-	printf(_("\nIf no input file name is supplied, then standard input is used.\n\n"));
-	printf(_("Report bugs to <pgsql-bugs@postgresql.org>.\n"));
+	write_msg( NULL, _("%s restores a PostgreSQL database from an archive created by pg_dump.\n\n"), progname);
+	write_msg( NULL, _("Usage:\n"));
+	write_msg( NULL, _("  %s [OPTION]... [FILE]\n"), progname);
+    
+	write_msg( NULL, _("\nGeneral options:\n"));
+	write_msg( NULL, _("  -d, --dbname=NAME        connect to database name\n"));
+	write_msg( NULL, _("  -f, --file=FILENAME      output file name\n"));
+	write_msg( NULL, _("  -F, --format=c|d|t       backup file format (should be automatic)\n"));
+	write_msg( NULL, _("  -l, --list               print summarized TOC of the archive\n"));
+	write_msg( NULL, _("  -v, --verbose            verbose mode\n"));
+	write_msg( NULL, _("  --help                   show this help, then exit\n"));
+	write_msg( NULL, _("  --version                output version information, then exit\n"));
+    
+	write_msg( NULL, _("\nOptions controlling the restore:\n"));
+	write_msg( NULL, _("  -a, --data-only          restore only the data, no schema\n"));
+	write_msg( NULL, _("  -c, --clean              clean (drop) database objects before recreating\n"));
+	write_msg( NULL, _("  -C, --create             create the target database\n"));
+	write_msg( NULL, _("  -e, --exit-on-error      exit on error, default is to continue\n"));
+	write_msg( NULL, _("  -I, --index=NAME         restore named index\n"));
+	write_msg( NULL, _("  -j, --jobs=NUM           use this many parallel jobs to restore\n"));
+	write_msg( NULL, _("  -L, --use-list=FILENAME  use table of contents from this file for\n"
+                       "                           selecting/ordering output\n"));
+	write_msg( NULL, _("  -n, --schema=NAME        restore only objects in this schema\n"));
+	write_msg( NULL, _("  -O, --no-owner           skip restoration of object ownership\n"));
+	write_msg( NULL, _("  -P, --function=NAME(args)\n"
+                       "                           restore named function\n"));
+	write_msg( NULL, _("  -s, --schema-only        restore only the schema, no data\n"));
+	write_msg( NULL, _("  -S, --superuser=NAME     superuser user name to use for disabling triggers\n"));
+	write_msg( NULL, _("  -t, --table=NAME         restore named table\n"));
+	write_msg( NULL, _("  -T, --trigger=NAME       restore named trigger\n"));
+	write_msg( NULL, _("  -x, --no-privileges      skip restoration of access privileges (grant/revoke)\n"));
+	write_msg( NULL, _("  -1, --single-transaction\n"
+                       "                           restore as a single transaction\n"));
+	write_msg( NULL, _("  --disable-triggers       disable triggers during data-only restore\n"));
+	write_msg( NULL, _("  --no-data-for-failed-tables\n"
+                       "                           do not restore data of tables that could not be\n"
+                       "                           created\n"));
+	write_msg( NULL, _("  --no-security-labels     do not restore security labels\n"));
+	write_msg( NULL, _("  --no-tablespaces         do not restore tablespace assignments\n"));
+	write_msg( NULL, _("  --use-set-session-authorization\n"
+                       "                           use SET SESSION AUTHORIZATION commands instead of\n"
+                       "                           ALTER OWNER commands to set ownership\n"));
+    
+	write_msg( NULL, _("\nConnection options:\n"));
+	write_msg( NULL, _("  -h, --host=HOSTNAME      database server host or socket directory\n"));
+	write_msg( NULL, _("  -p, --port=PORT          database server port number\n"));
+	write_msg( NULL, _("  -U, --username=NAME      connect as specified database user\n"));
+	write_msg( NULL, _("  -w, --no-password        never prompt for password\n"));
+	write_msg( NULL, _("  -W, --password           force password prompt (should happen automatically)\n"));
+	write_msg( NULL, _("  --role=ROLENAME          do SET ROLE before restore\n"));
+    
+	write_msg( NULL, _("\nIf no input file name is supplied, then standard input is used.\n\n"));
+	write_msg( NULL, _("Report bugs to <pgsql-bugs@postgresql.org>.\n"));
 }

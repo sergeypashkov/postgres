@@ -573,4 +573,6 @@ extern void getExtensionMembership(Archive *fout, ExtensionInfo extinfo[],
 					   int numExtensions);
 extern EventTriggerInfo *getEventTriggers(Archive *fout, int *numEventTriggers);
 
+extern int pg_dump( int argc, const char** argv, char** outMsgBuf );
+
 #endif   /* PG_DUMP_H */
