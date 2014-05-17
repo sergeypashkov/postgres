@@ -303,7 +303,7 @@ endif
 
 .PHONY: all-lib all-static-lib all-shared-lib
 
-all-lib: all-shared-lib
+#all-lib: all-shared-lib
 ifdef soname
 # no static library when building a dynamically loadable module
 all-lib: all-static-lib
@@ -325,8 +325,8 @@ ifeq (,$(filter cygwin win32,$(PORTNAME)))
 ifneq ($(PORTNAME), aix)
 
 # Normal case
-$(shlib): $(OBJS) | $(SHLIB_PREREQS)
-	$(LINK.shared) -o $@ $(OBJS) $(LDFLAGS) $(LDFLAGS_SL) $(SHLIB_LINK)
+# $(shlib): $(OBJS) | $(SHLIB_PREREQS)
+#	$(LINK.shared) -o $@ $(OBJS) $(LDFLAGS) $(LDFLAGS_SL) $(SHLIB_LINK)
 ifdef shlib_major
 # If we're using major and minor versions, then make a symlink to major-version-only.
 ifneq ($(shlib), $(shlib_major))

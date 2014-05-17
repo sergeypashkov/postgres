@@ -236,6 +236,8 @@ exit_nicely(int code)
 		ExitThread(code);
 #endif
 
+    on_exit_nicely_index = 0;
+    
     CleanDumpable();
     
 	if( code && g_jmpEnv )
