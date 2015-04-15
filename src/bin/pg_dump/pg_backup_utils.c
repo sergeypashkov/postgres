@@ -16,6 +16,84 @@
 #include "pg_backup_utils.h"
 #include "parallel.h"
 
+#ifdef WIN32
+
+#ifndef VA_COPY
+# ifdef HAVE_VA_COPY
+#  define VA_COPY(dest, src) va_copy(dest, src)
+# else
+#  ifdef HAVE___VA_COPY
+#   define VA_COPY(dest, src) __va_copy(dest, src)
+#  else
+#   define VA_COPY(dest, src) (dest) = (src)
+#  endif
+# endif
+#endif
+
+#define INIT_SZ 128
+
+int
+vasprintf(char **str, const char *fmt, va_list ap)
+{
+    int ret = -1;
+    va_list ap2;
+    char *string, *newstr;
+    size_t len;
+    
+    VA_COPY(ap2, ap);
+    if ((string = malloc(INIT_SZ)) == NULL)
+        goto fail;
+    
+    ret = vsnprintf(string, INIT_SZ, fmt, ap2);
+    if (ret >= 0 && ret < INIT_SZ) { /* succeeded with initial alloc */
+        *str = string;
+    } else if (ret == INT_MAX || ret < 0) { /* Bad length */
+        goto fail;
+    } else {        /* bigger than initial, realloc allowing for nul */
+        len = (size_t)ret + 1;
+        if ((newstr = realloc(string, len)) == NULL) {
+            free(string);
+            goto fail;
+        } else {
+            va_end(ap2);
+            VA_COPY(ap2, ap);
+            ret = vsnprintf(newstr, len, fmt, ap2);
+            if (ret >= 0 && (size_t)ret < len) {
+                *str = newstr;
+            } else { /* failed with realloc'ed string, give up */
+                free(newstr);
+                goto fail;
+            }
+        }
+    }
+    va_end(ap2);
+    return (ret);
+    
+fail:
+    *str = NULL;
+    errno = ENOMEM;
+    va_end(ap2);
+    return (-1);
+}
+
+int asprintf(char **str, const char *fmt, ...)
+{
+    va_list ap;
+    int ret;
+    
+    *str = NULL;
+    va_start(ap, fmt);
+    ret = vasprintf(str, fmt, ap);
+    va_end(ap);
+    
+    return ret;
+}
+#endif // WIN32
+
+
+char **g_outMsgBuf = NULL;
+jmp_buf* g_jmpEnv = NULL;
+
 /* Globals exported by this file */
 const char *progname = NULL;
 
@@ -51,10 +129,10 @@ set_dump_section(const char *arg, int *dumpSections)
 		*dumpSections |= DUMP_POST_DATA;
 	else
 	{
-		fprintf(stderr, _("%s: unrecognized section name: \"%s\"\n"),
-				progname, arg);
-		fprintf(stderr, _("Try \"%s --help\" for more information.\n"),
-				progname);
+		write_msg( NULL, _("%s: unrecognized section name: \"%s\"\n"),
+                  progname, arg);
+		write_msg( NULL, _("Try \"%s --help\" for more information.\n"),
+                  progname);
 		exit_nicely(1);
 	}
 }
@@ -83,14 +161,50 @@ write_msg(const char *modulename, const char *fmt,...)
 void
 vwrite_msg(const char *modulename, const char *fmt, va_list ap)
 {
-	if (progname)
-	{
-		if (modulename)
-			fprintf(stderr, "%s: [%s] ", progname, _(modulename));
-		else
-			fprintf(stderr, "%s: ", progname);
-	}
-	vfprintf(stderr, _(fmt), ap);
+    char* title     = NULL;
+    char* message   = NULL;
+    char* newBuf    = NULL;
+    
+    size_t titleLen   = 0;
+    size_t messageLen = 0;
+    size_t bufLen     = 0;
+    
+    if( g_outMsgBuf == NULL )
+        return;
+    
+    if( modulename )
+		asprintf( &title, "%s: [%s] ", progname, _(modulename) );
+	else
+		asprintf( &title, "%s: ", progname);
+    
+    vasprintf (&message, _(fmt), ap);
+    
+    titleLen   = strlen( title );
+    messageLen = strlen( message );
+    
+    if( *g_outMsgBuf == NULL )
+    {
+        *g_outMsgBuf = (char*) malloc( titleLen + messageLen + 1 );
+        if( *g_outMsgBuf )
+        {
+            strcpy( *g_outMsgBuf, title );
+            strcat( *g_outMsgBuf, message );
+        }
+    }
+    else
+    {
+        bufLen = strlen( *g_outMsgBuf );
+        newBuf = (char*) realloc( *g_outMsgBuf, bufLen + titleLen + messageLen + 1 );
+        if( newBuf )
+        {
+            *g_outMsgBuf = newBuf;
+            strcat( *g_outMsgBuf, title );
+            strcat( *g_outMsgBuf, message );
+        }
+    }
+    
+	free( title );
+	free( message );
 }
 
 /* Register a callback to be run when exit_nicely is invoked. */
@@ -122,5 +236,10 @@ exit_nicely(int code)
 		ExitThread(code);
 #endif
 
-	exit(code);
+    on_exit_nicely_index = 0;
+    
+    CleanDumpable();
+    
+	if( code && g_jmpEnv )
+		longjmp( *g_jmpEnv, 1 );
 }

@@ -15,6 +15,8 @@
 #ifndef PG_BACKUP_UTILS_H
 #define PG_BACKUP_UTILS_H
 
+#include <setjmp.h>
+
 typedef enum					/* bits returned by set_dump_section */
 {
 	DUMP_PRE_DATA = 0x01,
@@ -36,5 +38,10 @@ vwrite_msg(const char *modulename, const char *fmt, va_list ap)
 __attribute__((format(PG_PRINTF_ATTRIBUTE, 2, 0)));
 extern void on_exit_nicely(on_exit_nicely_callback function, void *arg);
 extern void exit_nicely(int code) __attribute__((noreturn));
+
+extern void CleanDumpable( void );
+
+extern char **g_outMsgBuf;      /* Message buffer to return from the library */
+extern jmp_buf* g_jmpEnv;
 
 #endif   /* PG_BACKUP_UTILS_H */
