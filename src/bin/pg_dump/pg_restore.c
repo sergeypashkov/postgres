@@ -131,8 +131,6 @@ static int pg_restore_internal( int argc, const char** argv, char** outMsgBuf )
     CleanDumpable();
     
     g_outMsgBuf = outMsgBuf;
-    
-	set_pglocale_pgservice(argv[0], PG_TEXTDOMAIN("pg_dump"));
 
 	init_parallel_dump_utils();
 

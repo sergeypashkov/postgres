@@ -142,6 +142,15 @@ static int	no_synchronized_snapshots = 0;
 static int	no_unlogged_table_data = 0;
 static int	serializable_deferrable = 0;
 
+// Comments storage
+static PGresult*    gCommentsRes    = NULL;
+static CommentItem* gCommentItems   = NULL;
+static int          gCountComments  = -1;
+
+// SecLabels storage
+static PGresult*     gSecLabelsRes    = NULL;
+static SecLabelItem* gSecLabelItems   = NULL;
+static int           gCountSecLabels  = -1;
 
 static void help(const char *progname);
 static void setup_connection(Archive *AH, const char *dumpencoding,
@@ -270,6 +279,9 @@ static char *get_synchronized_snapshot(Archive *fout);
 static PGresult *ExecuteSqlQueryForSingleRow(Archive *fout, char *query);
 static void setupDumpWorker(Archive *AHX, RestoreOptions *ropt);
 
+static void CleanComments( void );
+static void CleanSecLabels( void );
+
 static void FreeStringList( SimpleStringList* list );
 static void FreeOidList( SimpleOidList* list );
 
@@ -389,8 +401,6 @@ static int pg_dump_internal( int argc, const char** argv, char** outMsgBuf )
     include_everything = true;
     
     CleanDumpable();
-    
-	set_pglocale_pgservice(argv[0], PG_TEXTDOMAIN("pg_dump"));
 
 	/*
 	 * Initialize what we need for parallel execution, especially for thread
@@ -428,6 +438,9 @@ static int pg_dump_internal( int argc, const char** argv, char** outMsgBuf )
 		}
 	}
 
+    if_exists = 0;
+    optindex = 1;
+    
 	while ((c = getopt_long(argc, argv, "abcCd:E:f:F:h:ij:n:N:oOp:RsS:t:T:U:vw:WxZ:",
 							long_options, &optindex)) != -1)
 	{
@@ -570,7 +583,7 @@ static int pg_dump_internal( int argc, const char** argv, char** outMsgBuf )
 				return 0;
 		}
 	}
-
+    
 	/*
 	 * Non-option argument specifies database name as long as it wasn't
 	 * already specified with -d / --dbname
@@ -912,6 +925,9 @@ int pg_dump( int argc, const char** argv, char** outMsgBuf )
     {
         res = 0;
     }
+    
+    CleanComments();
+    CleanSecLabels();
     
     g_jmpEnv = NULL;
     
@@ -7692,18 +7708,14 @@ static int
 findComments(Archive *fout, Oid classoid, Oid objoid,
 			 CommentItem **items)
 {
-	/* static storage for table of comments */
-	static CommentItem *comments = NULL;
-	static int	ncomments = -1;
-
 	CommentItem *middle = NULL;
 	CommentItem *low;
 	CommentItem *high;
 	int			nmatch;
 
 	/* Get comments if we didn't already */
-	if (ncomments < 0)
-		ncomments = collectComments(fout, &comments);
+	if (gCountComments < 0)
+		gCountComments = collectComments(fout, &gCommentItems);
 
 	/*
 	 * Pre-7.2, pg_description does not contain classoid, so collectComments
@@ -7716,8 +7728,8 @@ findComments(Archive *fout, Oid classoid, Oid objoid,
 	/*
 	 * Do binary search to find some item matching the object.
 	 */
-	low = &comments[0];
-	high = &comments[ncomments - 1];
+	low = &gCommentItems[0];
+	high = &gCommentItems[gCountComments - 1];
 	while (low <= high)
 	{
 		middle = low + (high - low) / 2;
@@ -7783,7 +7795,6 @@ findComments(Archive *fout, Oid classoid, Oid objoid,
 static int
 collectComments(Archive *fout, CommentItem **items)
 {
-	PGresult   *res;
 	PQExpBuffer query;
 	int			i_description;
 	int			i_classoid;
@@ -7820,25 +7831,25 @@ collectComments(Archive *fout, CommentItem **items)
 							 "ORDER BY objoid");
 	}
 
-	res = ExecuteSqlQuery(fout, query->data, PGRES_TUPLES_OK);
+	gCommentsRes = ExecuteSqlQuery(fout, query->data, PGRES_TUPLES_OK);
 
 	/* Construct lookup table containing OIDs in numeric form */
 
-	i_description = PQfnumber(res, "description");
-	i_classoid = PQfnumber(res, "classoid");
-	i_objoid = PQfnumber(res, "objoid");
-	i_objsubid = PQfnumber(res, "objsubid");
+	i_description = PQfnumber(gCommentsRes, "description");
+	i_classoid = PQfnumber(gCommentsRes, "classoid");
+	i_objoid = PQfnumber(gCommentsRes, "objoid");
+	i_objsubid = PQfnumber(gCommentsRes, "objsubid");
 
-	ntups = PQntuples(res);
+	ntups = PQntuples(gCommentsRes);
 
 	comments = (CommentItem *) pg_malloc(ntups * sizeof(CommentItem));
 
 	for (i = 0; i < ntups; i++)
 	{
-		comments[i].descr = PQgetvalue(res, i, i_description);
-		comments[i].classoid = atooid(PQgetvalue(res, i, i_classoid));
-		comments[i].objoid = atooid(PQgetvalue(res, i, i_objoid));
-		comments[i].objsubid = atoi(PQgetvalue(res, i, i_objsubid));
+		comments[i].descr = PQgetvalue(gCommentsRes, i, i_description);
+		comments[i].classoid = atooid(PQgetvalue(gCommentsRes, i, i_classoid));
+		comments[i].objoid = atooid(PQgetvalue(gCommentsRes, i, i_objoid));
+		comments[i].objsubid = atoi(PQgetvalue(gCommentsRes, i, i_objsubid));
 	}
 
 	/* Do NOT free the PGresult since we are keeping pointers into it */
@@ -12867,20 +12878,16 @@ dumpTableSecLabel(Archive *fout, TableInfo *tbinfo, const char *reltypename)
 static int
 findSecLabels(Archive *fout, Oid classoid, Oid objoid, SecLabelItem **items)
 {
-	/* static storage for table of security labels */
-	static SecLabelItem *labels = NULL;
-	static int	nlabels = -1;
-
 	SecLabelItem *middle = NULL;
 	SecLabelItem *low;
 	SecLabelItem *high;
 	int			nmatch;
 
 	/* Get security labels if we didn't already */
-	if (nlabels < 0)
-		nlabels = collectSecLabels(fout, &labels);
+	if (gCountSecLabels < 0)
+		gCountSecLabels = collectSecLabels(fout, &gSecLabelItems);
 
-	if (nlabels <= 0)			/* no labels, so no match is possible */
+	if (gCountSecLabels <= 0)			/* no labels, so no match is possible */
 	{
 		*items = NULL;
 		return 0;
@@ -12889,8 +12896,8 @@ findSecLabels(Archive *fout, Oid classoid, Oid objoid, SecLabelItem **items)
 	/*
 	 * Do binary search to find some item matching the object.
 	 */
-	low = &labels[0];
-	high = &labels[nlabels - 1];
+	low = &gSecLabelItems[0];
+	high = &gSecLabelItems[gCountSecLabels - 1];
 	while (low <= high)
 	{
 		middle = low + (high - low) / 2;
@@ -12954,7 +12961,6 @@ findSecLabels(Archive *fout, Oid classoid, Oid objoid, SecLabelItem **items)
 static int
 collectSecLabels(Archive *fout, SecLabelItem **items)
 {
-	PGresult   *res;
 	PQExpBuffer query;
 	int			i_label;
 	int			i_provider;
@@ -12972,26 +12978,26 @@ collectSecLabels(Archive *fout, SecLabelItem **items)
 						 "FROM pg_catalog.pg_seclabel "
 						 "ORDER BY classoid, objoid, objsubid");
 
-	res = ExecuteSqlQuery(fout, query->data, PGRES_TUPLES_OK);
+	gSecLabelsRes = ExecuteSqlQuery(fout, query->data, PGRES_TUPLES_OK);
 
 	/* Construct lookup table containing OIDs in numeric form */
-	i_label = PQfnumber(res, "label");
-	i_provider = PQfnumber(res, "provider");
-	i_classoid = PQfnumber(res, "classoid");
-	i_objoid = PQfnumber(res, "objoid");
-	i_objsubid = PQfnumber(res, "objsubid");
+	i_label = PQfnumber(gSecLabelsRes, "label");
+	i_provider = PQfnumber(gSecLabelsRes, "provider");
+	i_classoid = PQfnumber(gSecLabelsRes, "classoid");
+	i_objoid = PQfnumber(gSecLabelsRes, "objoid");
+	i_objsubid = PQfnumber(gSecLabelsRes, "objsubid");
 
-	ntups = PQntuples(res);
+	ntups = PQntuples(gSecLabelsRes);
 
 	labels = (SecLabelItem *) pg_malloc(ntups * sizeof(SecLabelItem));
 
 	for (i = 0; i < ntups; i++)
 	{
-		labels[i].label = PQgetvalue(res, i, i_label);
-		labels[i].provider = PQgetvalue(res, i, i_provider);
-		labels[i].classoid = atooid(PQgetvalue(res, i, i_classoid));
-		labels[i].objoid = atooid(PQgetvalue(res, i, i_objoid));
-		labels[i].objsubid = atoi(PQgetvalue(res, i, i_objsubid));
+		labels[i].label = PQgetvalue(gSecLabelsRes, i, i_label);
+		labels[i].provider = PQgetvalue(gSecLabelsRes, i, i_provider);
+		labels[i].classoid = atooid(PQgetvalue(gSecLabelsRes, i, i_classoid));
+		labels[i].objoid = atooid(PQgetvalue(gSecLabelsRes, i, i_objoid));
+		labels[i].objsubid = atoi(PQgetvalue(gSecLabelsRes, i, i_objsubid));
 	}
 
 	/* Do NOT free the PGresult since we are keeping pointers into it */
@@ -15763,6 +15769,26 @@ ExecuteSqlQueryForSingleRow(Archive *fout, char *query)
 					  ntups, query);
 
 	return res;
+}
+
+static void CleanComments( void )
+{
+    free( gCommentItems );
+    gCommentItems = NULL;
+    gCountComments = -1;
+    
+    PQclear( gCommentsRes );
+    gCommentsRes = NULL;
+}
+
+static void CleanSecLabels( void )
+{
+    free( gSecLabelItems );
+    gSecLabelItems = NULL;
+    gCountSecLabels = -1;
+    
+    PQclear( gSecLabelsRes );
+    gSecLabelsRes = NULL;
 }
 
 static void FreeStringList( SimpleStringList* list )
