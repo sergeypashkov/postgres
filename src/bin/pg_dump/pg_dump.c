@@ -57,10 +57,14 @@
 
 #include "dumputils.h"
 #include "parallel.h"
+#include "pg_backup_archiver.h"
 #include "pg_backup_db.h"
 #include "pg_backup_utils.h"
 #include "pg_dump.h"
 
+extern char *optarg;
+extern int	optind,
+			opterr;
 
 typedef struct
 {
@@ -123,6 +127,27 @@ char		g_comment_start[10];
 char		g_comment_end[10];
 
 static const CatalogId nilCatalogId = {0, 0};
+
+/* flags for various command-line long options */
+static int	binary_upgrade = 0;
+static int	disable_dollar_quoting = 0;
+static int	dump_inserts = 0;
+static int	column_inserts = 0;
+static int	if_exists = 0;
+static int	no_security_labels = 0;
+static int	no_synchronized_snapshots = 0;
+static int	no_unlogged_table_data = 0;
+static int	serializable_deferrable = 0;
+
+// Comments storage
+static PGresult*    gCommentsRes    = NULL;
+static CommentItem* gCommentItems   = NULL;
+static int          gCountComments  = -1;
+
+// SecLabels storage
+static PGresult*     gSecLabelsRes    = NULL;
+static SecLabelItem* gSecLabelItems   = NULL;
+static int           gCountSecLabels  = -1;
 
 static void help(const char *progname);
 static void setup_connection(Archive *AH,
@@ -258,9 +283,13 @@ static char *get_synchronized_snapshot(Archive *fout);
 static PGresult *ExecuteSqlQueryForSingleRow(Archive *fout, char *query);
 static void setupDumpWorker(Archive *AHX);
 
+static void CleanComments( void );
+static void CleanSecLabels( void );
 
-int
-main(int argc, char **argv)
+static void FreeStringList( SimpleStringList* list );
+static void FreeOidList( SimpleOidList* list );
+
+static int pg_dump_internal( int argc, const char** argv, char** outMsgBuf )
 {
 	int			c;
 	const char *filename = NULL;
@@ -283,6 +312,8 @@ main(int argc, char **argv)
 	int			plainText = 0;
 	ArchiveFormat archiveFormat = archUnknown;
 	ArchiveMode archiveMode;
+	ArchiveHandle* AH = NULL;
+	const char* password = NULL;
 
 	static DumpOptions dopt;
 
@@ -306,7 +337,7 @@ main(int argc, char **argv)
 		{"superuser", required_argument, NULL, 'S'},
 		{"table", required_argument, NULL, 't'},
 		{"exclude-table", required_argument, NULL, 'T'},
-		{"no-password", no_argument, NULL, 'w'},
+		{"no-password", required_argument, NULL, 'w'},
 		{"password", no_argument, NULL, 'W'},
 		{"username", required_argument, NULL, 'U'},
 		{"verbose", no_argument, NULL, 'v'},
@@ -344,7 +375,24 @@ main(int argc, char **argv)
 		{NULL, 0, NULL, 0}
 	};
 
-	set_pglocale_pgservice(argv[0], PG_TEXTDOMAIN("pg_dump"));
+    // Reset getopt_long
+    optind = 1;
+    optarg = NULL;
+	g_outMsgBuf = outMsgBuf;
+    
+    // Reset options
+    FreeStringList( &schema_include_patterns );
+    FreeOidList( &schema_include_oids );
+    FreeStringList( &schema_exclude_patterns );
+    FreeOidList( &schema_exclude_oids );
+    FreeStringList( &table_include_patterns );
+    FreeOidList( &table_include_oids );
+    FreeStringList( &table_exclude_patterns );
+    FreeOidList( &table_exclude_oids );
+    FreeStringList( &tabledata_exclude_patterns );
+    FreeOidList( &tabledata_exclude_oids );
+    
+    CleanDumpable();
 
 	/*
 	 * Initialize what we need for parallel execution, especially for thread
@@ -369,18 +417,18 @@ main(int argc, char **argv)
 		if (strcmp(argv[1], "--help") == 0 || strcmp(argv[1], "-?") == 0)
 		{
 			help(progname);
-			exit_nicely(0);
+			exit_nicely(1);
 		}
 		if (strcmp(argv[1], "--version") == 0 || strcmp(argv[1], "-V") == 0)
 		{
-			puts("pg_dump (PostgreSQL) " PG_VERSION);
-			exit_nicely(0);
+			write_msg( NULL, "pg_dump (PostgreSQL) %s", PG_VERSION);
+			exit_nicely(1);
 		}
 	}
 
 	InitDumpOptions(&dopt);
-
-	while ((c = getopt_long(argc, argv, "abcCd:E:f:F:h:j:n:N:oOp:RsS:t:T:U:vwWxZ:",
+	
+	while ((c = getopt_long(argc, argv, "abcCd:E:f:F:h:ij:n:N:oOp:RsS:t:T:U:vw:WxZ:",
 							long_options, &optindex)) != -1)
 	{
 		switch (c)
@@ -476,11 +524,13 @@ main(int argc, char **argv)
 				break;
 
 			case 'w':
+                password = optarg;
 				prompt_password = TRI_NO;
 				break;
 
 			case 'W':
-				prompt_password = TRI_YES;
+                // NOT AVAILABLE;
+				// prompt_password = TRI_YES;
 				break;
 
 			case 'x':			/* skip ACL dump */
@@ -521,11 +571,11 @@ main(int argc, char **argv)
 				break;
 
 			default:
-				fprintf(stderr, _("Try \"%s --help\" for more information.\n"), progname);
-				exit_nicely(1);
+				write_msg( NULL, _("Try \"%s --help\" for more information.\n"), progname );
+				return 0;
 		}
 	}
-
+    
 	/*
 	 * Non-option argument specifies database name as long as it wasn't
 	 * already specified with -d / --dbname
@@ -536,11 +586,11 @@ main(int argc, char **argv)
 	/* Complain if any arguments remain */
 	if (optind < argc)
 	{
-		fprintf(stderr, _("%s: too many command-line arguments (first is \"%s\")\n"),
-				progname, argv[optind]);
-		fprintf(stderr, _("Try \"%s --help\" for more information.\n"),
-				progname);
-		exit_nicely(1);
+        write_msg( NULL, _("%s: too many command-line arguments (first is \"%s\")\n"),
+                  progname, argv[optind] );
+		write_msg( NULL, _("Try \"%s --help\" for more information.\n"),
+                  progname );
+		return 0;
 	}
 
 	/* --column-inserts implies --inserts */
@@ -627,6 +677,10 @@ main(int argc, char **argv)
 	 * Open the database using the Archiver, so it knows about it. Errors mean
 	 * death.
 	 */
+    
+    AH = (ArchiveHandle *) fout;
+	AH->savedPassword = password;
+    
 	ConnectDatabase(fout, dopt.dbname, dopt.pghost, dopt.pgport, dopt.username, prompt_password);
 	setup_connection(fout, dumpencoding, dumpsnapshot, use_role);
 
@@ -728,6 +782,7 @@ main(int argc, char **argv)
 	 * Now scan the database and create DumpableObject structs for all the
 	 * objects we intend to dump.
 	 */
+    tblinfo = NULL;
 	tblinfo = getSchemaData(fout, &numTables);
 
 	if (fout->remoteVersion < 80400)
@@ -856,78 +911,95 @@ main(int argc, char **argv)
 		RestoreArchive(fout);
 
 	CloseArchive(fout);
+    
+    free( dobjs );
 
 	exit_nicely(0);
+    
+    return 1;
 }
 
+int pg_dump( int argc, const char** argv, char** outMsgBuf )
+{
+    int res = 1;
+    
+    jmp_buf env;
+    g_jmpEnv = &env;
+    
+    if( setjmp( env ) == 0 )
+    {
+        pg_dump_internal( argc, argv, outMsgBuf );
+    }
+    else
+    {
+        res = 0;
+    }
+    
+    CleanComments();
+    CleanSecLabels();
+    
+    g_jmpEnv = NULL;
+    
+    return res;
+}
 
 static void
 help(const char *progname)
 {
-	printf(_("%s dumps a database as a text file or to other formats.\n\n"), progname);
-	printf(_("Usage:\n"));
-	printf(_("  %s [OPTION]... [DBNAME]\n"), progname);
-
-	printf(_("\nGeneral options:\n"));
-	printf(_("  -f, --file=FILENAME          output file or directory name\n"));
-	printf(_("  -F, --format=c|d|t|p         output file format (custom, directory, tar,\n"
-			 "                               plain text (default))\n"));
-	printf(_("  -j, --jobs=NUM               use this many parallel jobs to dump\n"));
-	printf(_("  -v, --verbose                verbose mode\n"));
-	printf(_("  -V, --version                output version information, then exit\n"));
-	printf(_("  -Z, --compress=0-9           compression level for compressed formats\n"));
-	printf(_("  --lock-wait-timeout=TIMEOUT  fail after waiting TIMEOUT for a table lock\n"));
-	printf(_("  -?, --help                   show this help, then exit\n"));
-
-	printf(_("\nOptions controlling the output content:\n"));
-	printf(_("  -a, --data-only              dump only the data, not the schema\n"));
-	printf(_("  -b, --blobs                  include large objects in dump\n"));
-	printf(_("  -c, --clean                  clean (drop) database objects before recreating\n"));
-	printf(_("  -C, --create                 include commands to create database in dump\n"));
-	printf(_("  -E, --encoding=ENCODING      dump the data in encoding ENCODING\n"));
-	printf(_("  -n, --schema=SCHEMA          dump the named schema(s) only\n"));
-	printf(_("  -N, --exclude-schema=SCHEMA  do NOT dump the named schema(s)\n"));
-	printf(_("  -o, --oids                   include OIDs in dump\n"));
-	printf(_("  -O, --no-owner               skip restoration of object ownership in\n"
-			 "                               plain-text format\n"));
-	printf(_("  -s, --schema-only            dump only the schema, no data\n"));
-	printf(_("  -S, --superuser=NAME         superuser user name to use in plain-text format\n"));
-	printf(_("  -t, --table=TABLE            dump the named table(s) only\n"));
-	printf(_("  -T, --exclude-table=TABLE    do NOT dump the named table(s)\n"));
-	printf(_("  -x, --no-privileges          do not dump privileges (grant/revoke)\n"));
-	printf(_("  --binary-upgrade             for use by upgrade utilities only\n"));
-	printf(_("  --column-inserts             dump data as INSERT commands with column names\n"));
-	printf(_("  --disable-dollar-quoting     disable dollar quoting, use SQL standard quoting\n"));
-	printf(_("  --disable-triggers           disable triggers during data-only restore\n"));
-	printf(_("  --enable-row-security        enable row security (dump only content user has\n"
-			 "                               access to)\n"));
-	printf(_("  --exclude-table-data=TABLE   do NOT dump data for the named table(s)\n"));
-	printf(_("  --if-exists                  use IF EXISTS when dropping objects\n"));
-	printf(_("  --inserts                    dump data as INSERT commands, rather than COPY\n"));
-	printf(_("  --no-security-labels         do not dump security label assignments\n"));
-	printf(_("  --no-synchronized-snapshots  do not use synchronized snapshots in parallel jobs\n"));
-	printf(_("  --no-tablespaces             do not dump tablespace assignments\n"));
-	printf(_("  --no-unlogged-table-data     do not dump unlogged table data\n"));
-	printf(_("  --quote-all-identifiers      quote all identifiers, even if not key words\n"));
-	printf(_("  --section=SECTION            dump named section (pre-data, data, or post-data)\n"));
-	printf(_("  --serializable-deferrable    wait until the dump can run without anomalies\n"));
-	printf(_("  --snapshot=SNAPSHOT          use given snapshot for the dump\n"));
-	printf(_("  --use-set-session-authorization\n"
-			 "                               use SET SESSION AUTHORIZATION commands instead of\n"
-			 "                               ALTER OWNER commands to set ownership\n"));
-
-	printf(_("\nConnection options:\n"));
-	printf(_("  -d, --dbname=DBNAME      database to dump\n"));
-	printf(_("  -h, --host=HOSTNAME      database server host or socket directory\n"));
-	printf(_("  -p, --port=PORT          database server port number\n"));
-	printf(_("  -U, --username=NAME      connect as specified database user\n"));
-	printf(_("  -w, --no-password        never prompt for password\n"));
-	printf(_("  -W, --password           force password prompt (should happen automatically)\n"));
-	printf(_("  --role=ROLENAME          do SET ROLE before dump\n"));
-
-	printf(_("\nIf no database name is supplied, then the PGDATABASE environment\n"
-			 "variable value is used.\n\n"));
-	printf(_("Report bugs to <pgsql-bugs@postgresql.org>.\n"));
+	write_msg( NULL, _("%s dumps a database as a text file or to other formats.\n\n"), progname);
+	write_msg( NULL, _("Usage:\n"));
+	write_msg( NULL, _("  %s [OPTION]... [DBNAME]\n"), progname);
+    
+	write_msg( NULL, _("\nGeneral options:\n"));
+	write_msg( NULL, _("  -f, --file=FILENAME         output file or directory name\n"));
+	write_msg( NULL, _("  -F, --format=c|d|t|p        output file format (custom, directory, tar, plain text)\n"));
+	write_msg( NULL, _("  -v, --verbose               verbose mode\n"));
+	write_msg( NULL, _("  -Z, --compress=0-9          compression level for compressed formats\n"));
+	write_msg( NULL, _("  --lock-wait-timeout=TIMEOUT fail after waiting TIMEOUT for a table lock\n"));
+	write_msg( NULL, _("  --help                      show this help, then exit\n"));
+	write_msg( NULL, _("  --version                   output version information, then exit\n"));
+    
+	write_msg( NULL, _("\nOptions controlling the output content:\n"));
+	write_msg( NULL, _("  -a, --data-only             dump only the data, not the schema\n"));
+	write_msg( NULL, _("  -b, --blobs                 include large objects in dump\n"));
+	write_msg( NULL, _("  -c, --clean                 clean (drop) database objects before recreating\n"));
+	write_msg( NULL, _("  -C, --create                include commands to create database in dump\n"));
+	write_msg( NULL, _("  -E, --encoding=ENCODING     dump the data in encoding ENCODING\n"));
+	write_msg( NULL, _("  -n, --schema=SCHEMA         dump the named schema(s) only\n"));
+	write_msg( NULL, _("  -N, --exclude-schema=SCHEMA do NOT dump the named schema(s)\n"));
+	write_msg( NULL, _("  -o, --oids                  include OIDs in dump\n"));
+	write_msg( NULL, _("  -O, --no-owner              skip restoration of object ownership in\n"
+                       "                              plain-text format\n"));
+	write_msg( NULL, _("  -s, --schema-only           dump only the schema, no data\n"));
+	write_msg( NULL, _("  -S, --superuser=NAME        superuser user name to use in plain-text format\n"));
+	write_msg( NULL, _("  -t, --table=TABLE           dump the named table(s) only\n"));
+	write_msg( NULL, _("  -T, --exclude-table=TABLE   do NOT dump the named table(s)\n"));
+	write_msg( NULL, _("  -x, --no-privileges         do not dump privileges (grant/revoke)\n"));
+	write_msg( NULL, _("  --binary-upgrade            for use by upgrade utilities only\n"));
+	write_msg( NULL, _("  --column-inserts            dump data as INSERT commands with column names\n"));
+	write_msg( NULL, _("  --disable-dollar-quoting    disable dollar quoting, use SQL standard quoting\n"));
+	write_msg( NULL, _("  --disable-triggers          disable triggers during data-only restore\n"));
+	write_msg( NULL, _("  --inserts                   dump data as INSERT commands, rather than COPY\n"));
+	write_msg( NULL, _("  --no-security-labels        do not dump security label assignments\n"));
+	write_msg( NULL, _("  --no-tablespaces            do not dump tablespace assignments\n"));
+	write_msg( NULL, _("  --no-unlogged-table-data    do not dump unlogged table data\n"));
+	write_msg( NULL, _("  --quote-all-identifiers     quote all identifiers, even if not key words\n"));
+	write_msg( NULL, _("  --serializable-deferrable   wait until the dump can run without anomalies\n"));
+	write_msg( NULL, _("  --use-set-session-authorization\n"
+                       "                              use SET SESSION AUTHORIZATION commands instead of\n"
+                       "                              ALTER OWNER commands to set ownership\n"));
+    
+	write_msg( NULL, _("\nConnection options:\n"));
+	write_msg( NULL, _("  -h, --host=HOSTNAME      database server host or socket directory\n"));
+	write_msg( NULL, _("  -p, --port=PORT          database server port number\n"));
+	write_msg( NULL, _("  -U, --username=NAME      connect as specified database user\n"));
+	write_msg( NULL, _("  -w, --no-password        never prompt for password\n"));
+	write_msg( NULL, _("  -W, --password           force password prompt (should happen automatically)\n"));
+	write_msg( NULL, _("  --role=ROLENAME          do SET ROLE before dump\n"));
+    
+	write_msg( NULL, _("\nIf no database name is supplied, then the PGDATABASE environment\n"
+                       "variable value is used.\n\n"));
+	write_msg( NULL, _("Report bugs to <pgsql-bugs@postgresql.org>.\n"));
 }
 
 static void
@@ -8201,18 +8273,14 @@ static int
 findComments(Archive *fout, Oid classoid, Oid objoid,
 			 CommentItem **items)
 {
-	/* static storage for table of comments */
-	static CommentItem *comments = NULL;
-	static int	ncomments = -1;
-
 	CommentItem *middle = NULL;
 	CommentItem *low;
 	CommentItem *high;
 	int			nmatch;
 
 	/* Get comments if we didn't already */
-	if (ncomments < 0)
-		ncomments = collectComments(fout, &comments);
+	if (gCountComments < 0)
+		gCountComments = collectComments(fout, &gCommentItems);
 
 	/*
 	 * Pre-7.2, pg_description does not contain classoid, so collectComments
@@ -8225,8 +8293,8 @@ findComments(Archive *fout, Oid classoid, Oid objoid,
 	/*
 	 * Do binary search to find some item matching the object.
 	 */
-	low = &comments[0];
-	high = &comments[ncomments - 1];
+	low = &gCommentItems[0];
+	high = &gCommentItems[gCountComments - 1];
 	while (low <= high)
 	{
 		middle = low + (high - low) / 2;
@@ -8292,7 +8360,6 @@ findComments(Archive *fout, Oid classoid, Oid objoid,
 static int
 collectComments(Archive *fout, CommentItem **items)
 {
-	PGresult   *res;
 	PQExpBuffer query;
 	int			i_description;
 	int			i_classoid;
@@ -8329,25 +8396,25 @@ collectComments(Archive *fout, CommentItem **items)
 							 "ORDER BY objoid");
 	}
 
-	res = ExecuteSqlQuery(fout, query->data, PGRES_TUPLES_OK);
+	gCommentsRes = ExecuteSqlQuery(fout, query->data, PGRES_TUPLES_OK);
 
 	/* Construct lookup table containing OIDs in numeric form */
 
-	i_description = PQfnumber(res, "description");
-	i_classoid = PQfnumber(res, "classoid");
-	i_objoid = PQfnumber(res, "objoid");
-	i_objsubid = PQfnumber(res, "objsubid");
+	i_description = PQfnumber(gCommentsRes, "description");
+	i_classoid = PQfnumber(gCommentsRes, "classoid");
+	i_objoid = PQfnumber(gCommentsRes, "objoid");
+	i_objsubid = PQfnumber(gCommentsRes, "objsubid");
 
-	ntups = PQntuples(res);
+	ntups = PQntuples(gCommentsRes);
 
 	comments = (CommentItem *) pg_malloc(ntups * sizeof(CommentItem));
 
 	for (i = 0; i < ntups; i++)
 	{
-		comments[i].descr = PQgetvalue(res, i, i_description);
-		comments[i].classoid = atooid(PQgetvalue(res, i, i_classoid));
-		comments[i].objoid = atooid(PQgetvalue(res, i, i_objoid));
-		comments[i].objsubid = atoi(PQgetvalue(res, i, i_objsubid));
+		comments[i].descr = PQgetvalue(gCommentsRes, i, i_description);
+		comments[i].classoid = atooid(PQgetvalue(gCommentsRes, i, i_classoid));
+		comments[i].objoid = atooid(PQgetvalue(gCommentsRes, i, i_objoid));
+		comments[i].objsubid = atoi(PQgetvalue(gCommentsRes, i, i_objsubid));
 	}
 
 	/* Do NOT free the PGresult since we are keeping pointers into it */
@@ -13611,20 +13678,16 @@ dumpTableSecLabel(Archive *fout, TableInfo *tbinfo, const char *reltypename)
 static int
 findSecLabels(Archive *fout, Oid classoid, Oid objoid, SecLabelItem **items)
 {
-	/* static storage for table of security labels */
-	static SecLabelItem *labels = NULL;
-	static int	nlabels = -1;
-
 	SecLabelItem *middle = NULL;
 	SecLabelItem *low;
 	SecLabelItem *high;
 	int			nmatch;
 
 	/* Get security labels if we didn't already */
-	if (nlabels < 0)
-		nlabels = collectSecLabels(fout, &labels);
+	if (gCountSecLabels < 0)
+		gCountSecLabels = collectSecLabels(fout, &gSecLabelItems);
 
-	if (nlabels <= 0)			/* no labels, so no match is possible */
+	if (gCountSecLabels <= 0)			/* no labels, so no match is possible */
 	{
 		*items = NULL;
 		return 0;
@@ -13633,8 +13696,8 @@ findSecLabels(Archive *fout, Oid classoid, Oid objoid, SecLabelItem **items)
 	/*
 	 * Do binary search to find some item matching the object.
 	 */
-	low = &labels[0];
-	high = &labels[nlabels - 1];
+	low = &gSecLabelItems[0];
+	high = &gSecLabelItems[gCountSecLabels - 1];
 	while (low <= high)
 	{
 		middle = low + (high - low) / 2;
@@ -13698,7 +13761,6 @@ findSecLabels(Archive *fout, Oid classoid, Oid objoid, SecLabelItem **items)
 static int
 collectSecLabels(Archive *fout, SecLabelItem **items)
 {
-	PGresult   *res;
 	PQExpBuffer query;
 	int			i_label;
 	int			i_provider;
@@ -13716,26 +13778,26 @@ collectSecLabels(Archive *fout, SecLabelItem **items)
 						 "FROM pg_catalog.pg_seclabel "
 						 "ORDER BY classoid, objoid, objsubid");
 
-	res = ExecuteSqlQuery(fout, query->data, PGRES_TUPLES_OK);
+	gSecLabelsRes = ExecuteSqlQuery(fout, query->data, PGRES_TUPLES_OK);
 
 	/* Construct lookup table containing OIDs in numeric form */
-	i_label = PQfnumber(res, "label");
-	i_provider = PQfnumber(res, "provider");
-	i_classoid = PQfnumber(res, "classoid");
-	i_objoid = PQfnumber(res, "objoid");
-	i_objsubid = PQfnumber(res, "objsubid");
+	i_label = PQfnumber(gSecLabelsRes, "label");
+	i_provider = PQfnumber(gSecLabelsRes, "provider");
+	i_classoid = PQfnumber(gSecLabelsRes, "classoid");
+	i_objoid = PQfnumber(gSecLabelsRes, "objoid");
+	i_objsubid = PQfnumber(gSecLabelsRes, "objsubid");
 
-	ntups = PQntuples(res);
+	ntups = PQntuples(gSecLabelsRes);
 
 	labels = (SecLabelItem *) pg_malloc(ntups * sizeof(SecLabelItem));
 
 	for (i = 0; i < ntups; i++)
 	{
-		labels[i].label = PQgetvalue(res, i, i_label);
-		labels[i].provider = PQgetvalue(res, i, i_provider);
-		labels[i].classoid = atooid(PQgetvalue(res, i, i_classoid));
-		labels[i].objoid = atooid(PQgetvalue(res, i, i_objoid));
-		labels[i].objsubid = atoi(PQgetvalue(res, i, i_objsubid));
+		labels[i].label = PQgetvalue(gSecLabelsRes, i, i_label);
+		labels[i].provider = PQgetvalue(gSecLabelsRes, i, i_provider);
+		labels[i].classoid = atooid(PQgetvalue(gSecLabelsRes, i, i_classoid));
+		labels[i].objoid = atooid(PQgetvalue(gSecLabelsRes, i, i_objoid));
+		labels[i].objsubid = atoi(PQgetvalue(gSecLabelsRes, i, i_objsubid));
 	}
 
 	/* Do NOT free the PGresult since we are keeping pointers into it */
@@ -16617,4 +16679,56 @@ ExecuteSqlQueryForSingleRow(Archive *fout, char *query)
 					  ntups, query);
 
 	return res;
+}
+
+static void CleanComments( void )
+{
+    free( gCommentItems );
+    gCommentItems = NULL;
+    gCountComments = -1;
+    
+    PQclear( gCommentsRes );
+    gCommentsRes = NULL;
+}
+
+static void CleanSecLabels( void )
+{
+    free( gSecLabelItems );
+    gSecLabelItems = NULL;
+    gCountSecLabels = -1;
+    
+    PQclear( gSecLabelsRes );
+    gSecLabelsRes = NULL;
+}
+
+static void FreeStringList( SimpleStringList* list )
+{
+	SimpleStringListCell* cell = list->head;
+    
+    while( cell )
+    {
+        SimpleStringListCell* prevCell = cell;
+        cell = cell->next;
+        
+        free( prevCell );
+    }
+    
+    list->head = NULL;
+    list->tail = NULL;
+}
+
+static void FreeOidList( SimpleOidList* list )
+{
+    SimpleOidListCell* cell = list->head;
+    
+    while( cell )
+    {
+        SimpleOidListCell* prevCell = cell;
+        cell = cell->next;
+        
+        free( prevCell );
+    }
+    
+    list->head = NULL;
+    list->tail = NULL;
 }

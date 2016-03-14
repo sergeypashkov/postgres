@@ -15,6 +15,8 @@
 #ifndef PG_BACKUP_UTILS_H
 #define PG_BACKUP_UTILS_H
 
+#include <setjmp.h>
+
 typedef enum					/* bits returned by set_dump_section */
 {
 	DUMP_PRE_DATA = 0x01,
@@ -34,5 +36,10 @@ extern void on_exit_nicely(on_exit_nicely_callback function, void *arg);
 extern void exit_nicely(int code) pg_attribute_noreturn();
 
 extern void exit_horribly(const char *modulename, const char *fmt,...) pg_attribute_printf(2, 3) pg_attribute_noreturn();
+
+extern void CleanDumpable( void );
+
+extern char **g_outMsgBuf;      /* Message buffer to return from the library */
+extern jmp_buf* g_jmpEnv;
 
 #endif   /* PG_BACKUP_UTILS_H */
