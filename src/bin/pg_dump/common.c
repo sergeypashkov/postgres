@@ -993,3 +993,16 @@ strInArray(const char *pattern, char **arr, int arr_size)
 	}
 	return -1;
 }
+
+
+/* CleanDumpable -
+ *	 Cleans used memory for new dump ( if need )
+ */
+void
+CleanDumpable( void )
+{
+    free( dumpIdMap );
+	dumpIdMap = NULL;
+    allocedDumpIds = 0;
+    lastDumpId = 0;
+}

@@ -650,4 +650,6 @@ extern void processExtensionTables(Archive *fout, ExtensionInfo extinfo[],
 extern EventTriggerInfo *getEventTriggers(Archive *fout, int *numEventTriggers);
 extern void getPolicies(Archive *fout, TableInfo tblinfo[], int numTables);
 
+extern int pg_dump( int argc, const char** argv, char** outMsgBuf );
+
 #endif   /* PG_DUMP_H */
