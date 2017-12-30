@@ -712,4 +712,7 @@ extern void getPublicationTables(Archive *fout, TableInfo tblinfo[],
 					 int numTables);
 extern void getSubscriptions(Archive *fout);
 
-#endif							/* PG_DUMP_H */
+
+extern int pg_dump( int argc, const char** argv, char** outMsgBuf );
+
+#endif   /* PG_DUMP_H */
